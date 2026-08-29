@@ -279,10 +279,28 @@ impl KimiClient {
         if let Some(title) = title {
             payload["title"] = json!(title);
         }
-        let data = self
+        let created = self
             .data(Method::POST, "/api/v1/sessions", Some(payload))
             .await?;
-        Ok(json!({ "session": normalize_session(host_id, &data) }))
+        let session_id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .context("Kimi session creation omitted the session identity")?;
+        validate_path_segment(session_id, "sessionId")?;
+        let config = self.data(Method::GET, "/api/v1/config", None).await?;
+        let default_model = config
+            .get("default_model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("Kimi has no configured default model")?;
+        let profile = self
+            .data(
+                Method::POST,
+                &format!("/api/v1/sessions/{session_id}/profile"),
+                Some(json!({ "agent_config": { "model": default_model } })),
+            )
+            .await?;
+        Ok(json!({ "session": normalize_session(host_id, &profile) }))
     }
 
     async fn snapshot(&self, body: Value) -> Result<Value> {

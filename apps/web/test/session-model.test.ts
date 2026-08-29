@@ -6,6 +6,7 @@ import {
   decodeKimiEvent,
   finishAssistantTurn,
   shouldApplySequence,
+  turnFailureMessage,
   withInFlightMessage,
 } from "../src/session-model.js";
 
@@ -82,6 +83,20 @@ describe("Kimi session event model", () => {
   it("removes transport wrappers without changing ordinary content", () => {
     expect(cleanToolText("before <system>done</system> after")).toBe(
       "before done\n after",
+    );
+  });
+});
+
+describe("turnFailureMessage", () => {
+  it("explains a missing session model without exposing upstream details", () => {
+    expect(
+      turnFailureMessage({ error: { code: "model.not_configured" } }),
+    ).toBe("Kimi 会话没有绑定模型，请重新创建会话");
+  });
+
+  it("returns a bounded fallback for other upstream codes", () => {
+    expect(turnFailureMessage({ error: { code: "provider.failed" } })).toBe(
+      "Kimi 会话执行失败（provider.failed）",
     );
   });
 });

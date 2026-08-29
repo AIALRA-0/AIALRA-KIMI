@@ -169,6 +169,20 @@ export interface KimiEventEnvelope {
   payload: Record<string, unknown>;
 }
 
+export function turnFailureMessage(
+  payload: Record<string, unknown>,
+): string | null {
+  const error =
+    payload.error && typeof payload.error === "object"
+      ? (payload.error as Record<string, unknown>)
+      : null;
+  const code = typeof error?.code === "string" ? error.code : null;
+  if (!code) return null;
+  if (code === "model.not_configured")
+    return "Kimi 会话没有绑定模型，请重新创建会话";
+  return `Kimi 会话执行失败（${code}）`;
+}
+
 export function decodeKimiEvent(value: unknown): KimiEventEnvelope | null {
   if (!value || typeof value !== "object") return null;
   const envelope = value as Record<string, unknown>;

@@ -50,6 +50,7 @@ import {
   coalesceToolMessages,
   decodeKimiEvent,
   finishAssistantTurn,
+  turnFailureMessage,
   shouldApplySequence,
   withInFlightMessage,
   type UiFileEntry,
@@ -621,6 +622,8 @@ export default function App() {
       setSessionStatus((current) =>
         current ? { ...current, busy: false } : current,
       );
+      const failure = turnFailureMessage(event.payload);
+      if (failure) setError(failure);
       scheduleRefresh();
       return;
     }
