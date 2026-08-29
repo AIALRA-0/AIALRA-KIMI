@@ -209,6 +209,17 @@ export function TerminalPanel({
     onElevatedChange(next);
   }
 
+  function changeShell(next: TerminalShell) {
+    if (channel && !demo) {
+      void channel
+        .rpc("terminal.close", {})
+        .catch(() => undefined)
+        .finally(() => setShell(next));
+      return;
+    }
+    setShell(next);
+  }
+
   function submitCredentials(event: React.FormEvent) {
     event.preventDefault();
     if (!adminUsername.trim() || !adminPassword) return;
@@ -232,7 +243,7 @@ export function TerminalPanel({
         </div>
         <select
           value={effectiveShell}
-          onChange={(event) => setShell(event.target.value as TerminalShell)}
+          onChange={(event) => changeShell(event.target.value as TerminalShell)}
           aria-label="命令行环境"
         >
           {platform === "windows" ? (
