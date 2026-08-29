@@ -335,6 +335,8 @@ export default function App() {
     channelRef.current?.close();
     channelRef.current = null;
     setChannel(null);
+    setSessions([]);
+    setSessionId("");
     setMessages([]);
     setTasks([]);
     setApprovals([]);
@@ -344,6 +346,7 @@ export default function App() {
     setFilePreview(null);
     setUsage(null);
     setOauthFlow(null);
+    setError(null);
     oauthHostRef.current = null;
     if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
     void (async () => {
