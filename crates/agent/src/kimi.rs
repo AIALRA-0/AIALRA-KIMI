@@ -5,6 +5,7 @@ use reqwest::{Client, Method};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{process::Child, time::sleep};
+use tracing::warn;
 
 use crate::config::AgentConfig;
 
@@ -203,8 +204,8 @@ impl KimiClient {
                 required_path_segment(&body, "sessionId")?;
                 Ok(json!({ "subscribed": true }))
             }
-            "sessions.approvals.respond" => self.interaction(body, "approvals").await,
-            "sessions.questions.respond" => self.interaction(body, "questions").await,
+            "sessions.approvals.respond" => self.queue_interaction(body, "approvals"),
+            "sessions.questions.respond" => self.queue_interaction(body, "questions"),
             "sessions.questions.dismiss" => self.dismiss_question(body).await,
             "sessions.tasks.list" => {
                 let id = required_path_segment(&body, "sessionId")?;
@@ -399,12 +400,25 @@ impl KimiClient {
     async fn interaction(&self, mut body: Value, kind: &str) -> Result<Value> {
         let session = take_required_path_segment(&mut body, "sessionId")?;
         let interaction = take_required_path_segment(&mut body, "interactionId")?;
-        self.data(
+        self.data_with_timeout(
             Method::POST,
             &format!("/api/v1/sessions/{session}/{kind}/{interaction}"),
             Some(body),
+            Duration::from_secs(60 * 60),
         )
         .await
+    }
+
+    fn queue_interaction(&self, body: Value, kind: &'static str) -> Result<Value> {
+        required_path_segment(&body, "sessionId")?;
+        required_path_segment(&body, "interactionId")?;
+        let client = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = client.interaction(body, kind).await {
+                warn!(interaction_kind = kind, error = %error, "Kimi interaction response failed");
+            }
+        });
+        Ok(json!({ "accepted": true }))
     }
 
     async fn dismiss_question(&self, mut body: Value) -> Result<Value> {
@@ -549,6 +563,29 @@ impl KimiClient {
         self.data_accepting(method, path, body, &[0]).await
     }
 
+    async fn data_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let envelope = self
+            .request_with_timeout(method, path, body, timeout)
+            .await?;
+        let code = envelope.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code != 0 {
+            bail!(
+                "Kimi request failed with code {code}: {}",
+                envelope
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
+    }
+
     async fn data_accepting(
         &self,
         method: Method,
@@ -571,9 +608,21 @@ impl KimiClient {
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request_with_timeout(method, path, body, Duration::from_secs(30))
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
         let mut request = self
             .http
             .request(method, format!("{}{}", self.base_url, path))
+            .timeout(timeout)
             .bearer_auth(&self.token)
             .header("x-request-id", uuid::Uuid::new_v4().to_string());
         if let Some(body) = body {
@@ -840,5 +889,26 @@ mod tests {
         assert!(validate_path_segment("session_abc-123", "sessionId").is_ok());
         assert!(validate_path_segment("../oauth/usage", "sessionId").is_err());
         assert!(validate_path_segment("session%2Fadmin", "sessionId").is_err());
+    }
+
+    #[tokio::test]
+    async fn queues_interaction_without_waiting_for_upstream() {
+        let client = KimiClient {
+            http: Client::builder().build().unwrap(),
+            base_url: "http://127.0.0.1:9".to_owned(),
+            token: "test-token".to_owned(),
+        };
+        let result = client
+            .queue_interaction(
+                json!({
+                    "sessionId": "session-test",
+                    "interactionId": "approval-test",
+                    "decision": "approved",
+                    "scope": "session"
+                }),
+                "approvals",
+            )
+            .unwrap();
+        assert_eq!(result, json!({ "accepted": true }));
     }
 }
