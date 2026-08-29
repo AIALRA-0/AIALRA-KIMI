@@ -1553,12 +1553,12 @@ button:disabled {
   font-size: 9px;
 }
 .usage-error {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
   gap: 12px;
   margin-top: 16px;
-  padding: 10px;
+  padding: 14px;
   border: 1px solid color-mix(in srgb, var(--orange) 28%, var(--line));
   border-radius: 9px;
   color: var(--orange);
@@ -1566,7 +1566,14 @@ button:disabled {
 }
 
 .usage-error span {
-  flex: 1;
+  min-width: 0;
+  align-self: center;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+
+.usage-error .oauth-login-actions {
+  flex-wrap: nowrap;
 }
 
 .terminal-loading {
@@ -1692,7 +1699,8 @@ button:disabled {
 
 .oauth-login-actions {
   display: flex;
-  align-items: end;
+  align-items: flex-end;
+  justify-content: center;
   gap: 12px;
   flex-wrap: wrap;
 }
@@ -1706,11 +1714,35 @@ button:disabled {
 
 .oauth-login-actions select {
   min-width: 180px;
+  height: 38px;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   background: var(--panel);
   color: var(--text);
   padding: 9px 32px 9px 10px;
+}
+
+.oauth-login-actions button {
+  min-height: 38px;
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .usage-error {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .usage-error .oauth-login-actions {
+    align-items: stretch;
+    justify-content: stretch;
+  }
+
+  .usage-error .oauth-login-actions label,
+  .usage-error .oauth-login-actions select,
+  .usage-error .oauth-login-actions button {
+    width: 100%;
+  }
 }
 .oauth-device strong {
   color: var(--text);

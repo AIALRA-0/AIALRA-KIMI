@@ -127,6 +127,13 @@ function relativeTime(value: string | null): string {
   return `${Math.floor(minutes / 1440)} 天前`;
 }
 
+function usageErrorText(value: string): string {
+  if (/No token for ['\"]kimi-code['\"]/i.test(value)) {
+    return "这台主机尚未登录 Kimi Code，请先完成账号授权";
+  }
+  return value;
+}
+
 function messageTime(value: string): string {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed)
@@ -1576,7 +1583,7 @@ export default function App() {
                   </div>
                   {usage.upstreamError && (
                     <div className="usage-error">
-                      <span>{usage.upstreamError}</span>
+                      <span>{usageErrorText(usage.upstreamError)}</span>
                       {host?.state === "online" && (
                         <div className="oauth-login-actions">
                           <label>
@@ -1590,9 +1597,7 @@ export default function App() {
                                 )
                               }
                             >
-                              <option value="mainland-cn">
-                                中国大陆（+86）
-                              </option>
+                              <option value="mainland-cn">中国大陆账号</option>
                               <option value="global">全球账号</option>
                             </select>
                           </label>
@@ -1600,7 +1605,7 @@ export default function App() {
                             className="secondary-button"
                             onClick={() => void startKimiLogin()}
                           >
-                            登录 Kimi
+                            授权此主机
                           </button>
                         </div>
                       )}
@@ -1647,14 +1652,23 @@ export default function App() {
                 {oauthFlow?.status === "pending" && (
                   <div className="oauth-device">
                     <strong>验证码 {oauthFlow.user_code}</strong>
-                    <span>请在新打开的 Kimi 页面中完成登录</span>
+                    <span>请先登录 Kimi 官网，再继续授权这台主机</span>
+                    {oauthRegion === "mainland-cn" && (
+                      <a
+                        href="https://www.kimi.com/code"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        使用中国大陆手机号登录 Kimi 官网
+                      </a>
+                    )}
                     {oauthFlow.verification_uri_complete && (
                       <a
                         href={oauthFlow.verification_uri_complete}
                         target="_blank"
                         rel="noreferrer"
                       >
-                        打开登录页面
+                        继续授权此主机
                       </a>
                     )}
                   </div>
@@ -1676,7 +1690,7 @@ export default function App() {
                           setOauthRegion(event.target.value as KimiOAuthRegion)
                         }
                       >
-                        <option value="mainland-cn">中国大陆（+86）</option>
+                        <option value="mainland-cn">中国大陆账号</option>
                         <option value="global">全球账号</option>
                       </select>
                     </label>
@@ -1684,21 +1698,30 @@ export default function App() {
                       className="primary-button"
                       onClick={() => void startKimiLogin()}
                     >
-                      登录 Kimi
+                      授权此主机
                     </button>
                   </div>
                 )}
                 {oauthFlow?.status === "pending" && (
                   <div className="oauth-device">
                     <strong>验证码 {oauthFlow.user_code}</strong>
-                    <span>请在新打开的 Kimi 页面中完成登录</span>
+                    <span>请先登录 Kimi 官网，再继续授权这台主机</span>
+                    {oauthRegion === "mainland-cn" && (
+                      <a
+                        href="https://www.kimi.com/code"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        使用中国大陆手机号登录 Kimi 官网
+                      </a>
+                    )}
                     {oauthFlow.verification_uri_complete && (
                       <a
                         href={oauthFlow.verification_uri_complete}
                         target="_blank"
                         rel="noreferrer"
                       >
-                        打开登录页面
+                        继续授权此主机
                       </a>
                     )}
                   </div>
