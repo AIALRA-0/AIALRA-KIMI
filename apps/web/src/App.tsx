@@ -40,12 +40,14 @@ import {
   type UiSession,
 } from "./demo.js";
 import { InteractionCards } from "./InteractionCards.js";
+import { MarkdownMessage, ToolMessage } from "./MessageBody.js";
 import { NewSessionDialog, type NewSessionInput } from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
 import { BrowserRelay, type RelayChannel } from "./relay.js";
 import { TerminalPanel } from "./TerminalPanel.js";
 import {
   appendAssistantDelta,
+  coalesceToolMessages,
   decodeKimiEvent,
   finishAssistantTurn,
   shouldApplySequence,
@@ -166,6 +168,10 @@ export default function App() {
   );
   const [messages, setMessages] = useState<UiMessage[]>(
     demo ? demoMessages : [],
+  );
+  const conversationMessages = useMemo(
+    () => coalesceToolMessages(messages),
+    [messages],
   );
   const [usage, setUsage] = useState<UsageSnapshot | null>(
     demo ? demoUsage : null,
@@ -548,6 +554,10 @@ export default function App() {
             event.payload.description ??
               displayEventValue(event.payload.display ?? event.payload.args),
           ),
+          toolInput: String(
+            event.payload.description ??
+              displayEventValue(event.payload.display ?? event.payload.args),
+          ),
           time: event.timestamp ?? "",
           streaming: true,
         },
@@ -563,7 +573,7 @@ export default function App() {
         setMessages((current) =>
           current.map((item) =>
             item.id === `live-tool:${callId}`
-              ? { ...item, text: update.text as string }
+              ? { ...item, toolOutput: update.text as string }
               : item,
           ),
         );
@@ -576,7 +586,7 @@ export default function App() {
           item.id === `live-tool:${callId}`
             ? {
                 ...item,
-                text: displayEventValue(event.payload.output),
+                toolOutput: displayEventValue(event.payload.output),
                 streaming: false,
                 isError: Boolean(event.payload.isError),
               }
@@ -1378,7 +1388,7 @@ export default function App() {
                   <Clock3 size={14} />
                   <span>会话记录</span>
                 </div>
-                {messages.map((message) => (
+                {conversationMessages.map((message) => (
                   <article
                     key={message.id}
                     className={`message ${message.role} ${message.isError ? "error" : ""}`}
@@ -1404,7 +1414,11 @@ export default function App() {
                         <span>{messageTime(message.time)}</span>
                         {message.streaming && <em>处理中</em>}
                       </div>
-                      <p>{message.text}</p>
+                      {message.role === "tool" ? (
+                        <ToolMessage message={message} />
+                      ) : (
+                        <MarkdownMessage text={message.text} />
+                      )}
                       {message.streaming && (
                         <div className="working-line">
                           <i />

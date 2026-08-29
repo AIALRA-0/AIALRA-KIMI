@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   appendAssistantDelta,
+  cleanToolText,
+  coalesceToolMessages,
   decodeKimiEvent,
   finishAssistantTurn,
   shouldApplySequence,
@@ -46,5 +48,40 @@ describe("Kimi session event model", () => {
     expect(shouldApplySequence(20, 19)).toBe(false);
     expect(shouldApplySequence(20, 21)).toBe(true);
     expect(shouldApplySequence(20, null)).toBe(true);
+  });
+
+  it("merges a tool call and result into one collapsible message", () => {
+    expect(
+      coalesceToolMessages([
+        {
+          id: "call",
+          role: "tool",
+          toolCallId: "one",
+          toolName: "Shell",
+          text: '{"command":"echo ok"}',
+          time: "now",
+        },
+        {
+          id: "result",
+          role: "tool",
+          toolCallId: "one",
+          toolName: "result",
+          text: "<system>Command executed successfully.</system>ok",
+          time: "now",
+        },
+      ]),
+    ).toEqual([
+      expect.objectContaining({
+        toolName: "Shell",
+        toolInput: '{\n  "command": "echo ok"\n}',
+        toolOutput: "Command executed successfully.\nok",
+      }),
+    ]);
+  });
+
+  it("removes transport wrappers without changing ordinary content", () => {
+    expect(cleanToolText("before <system>done</system> after")).toBe(
+      "before done\n after",
+    );
   });
 });

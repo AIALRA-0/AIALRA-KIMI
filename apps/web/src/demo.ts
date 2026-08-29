@@ -88,7 +88,23 @@ export const demoMessages: UiMessage[] = [
   {
     id: "message-2",
     role: "assistant",
-    text: "固定版本的应用检查已在此合成演示中通过，我发现了一个模拟的重连阻断问题：中继从旧序列恢复时，浏览器可能重复收到最后一条事件",
+    text: "## 发布检查\n\n固定版本已经通过以下项目：\n\n- 控制平面构建\n- 双主机重连\n- 浏览器回归\n\n> 仍需完成生产健康检查后再推广",
+    time: "19:17",
+  },
+  {
+    id: "message-tool",
+    role: "tool",
+    toolCallId: "demo-check",
+    toolName: "Shell",
+    text: '{"command":"verify-release --production"}',
+    time: "19:17",
+  },
+  {
+    id: "message-result",
+    role: "tool",
+    toolCallId: "demo-check",
+    toolName: "result",
+    text: "<system>Command executed successfully.</system>health: ok",
     time: "19:17",
   },
   {

@@ -8,7 +8,64 @@ export interface UiMessage {
   streaming?: boolean;
   toolCallId?: string;
   toolName?: string;
+  toolInput?: string;
+  toolOutput?: string;
   isError?: boolean;
+}
+
+export function cleanToolText(value: string): string {
+  const withoutSystemEnvelope = value.replace(
+    /<system>([\s\S]*?)<\/system>/gu,
+    "$1\n",
+  );
+  const trimmed = withoutSystemEnvelope.trim();
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return trimmed;
+  }
+}
+
+export function coalesceToolMessages(messages: UiMessage[]): UiMessage[] {
+  const result: UiMessage[] = [];
+  const calls = new Map<string, number>();
+
+  for (const message of messages) {
+    if (message.role !== "tool") {
+      result.push(message);
+      continue;
+    }
+
+    const callId = message.toolCallId;
+    const isResult = message.toolName?.toLowerCase() === "result";
+    if (isResult && callId && calls.has(callId)) {
+      const index = calls.get(callId)!;
+      const existing = result[index];
+      if (existing) {
+        const merged: UiMessage = {
+          ...existing,
+          toolOutput: cleanToolText(message.toolOutput ?? message.text),
+          streaming: false,
+        };
+        if (message.isError !== undefined) merged.isError = message.isError;
+        result[index] = merged;
+      }
+      continue;
+    }
+
+    const normalized: UiMessage = { ...message };
+    if (isResult) {
+      normalized.toolOutput = cleanToolText(message.toolOutput ?? message.text);
+    } else {
+      normalized.toolInput = cleanToolText(message.toolInput ?? message.text);
+      if (message.toolOutput)
+        normalized.toolOutput = cleanToolText(message.toolOutput);
+    }
+    if (callId && !isResult) calls.set(callId, result.length);
+    result.push(normalized);
+  }
+
+  return result;
 }
 
 export interface UiApproval {

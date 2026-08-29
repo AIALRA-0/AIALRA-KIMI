@@ -81,3 +81,21 @@ test("offers outbound-only VPS and remote host pairing", async ({
     page.getByText("主机只主动向外连接，不开放公网端口"),
   ).toBeVisible();
 });
+
+test("renders Markdown and collapses completed tool calls", async ({
+  page,
+}) => {
+  await expect(
+    page.getByRole("heading", { name: "发布检查", level: 2 }),
+  ).toBeVisible();
+  await expect(page.getByRole("listitem").first()).toContainText(
+    "控制平面构建",
+  );
+
+  const tool = page.locator("details.tool-card").first();
+  await expect(tool).not.toHaveAttribute("open", "");
+  await expect(tool.getByText("health: ok")).not.toBeVisible();
+  await tool.locator("summary").click();
+  await expect(tool.getByText("health: ok")).toBeVisible();
+  await expect(tool.getByText("<system>")).toHaveCount(0);
+});
