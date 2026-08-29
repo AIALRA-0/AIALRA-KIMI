@@ -230,6 +230,7 @@ export default function App() {
   const cursorRef = useRef(new Map<string, number>());
   const refreshTimer = useRef<number | null>(null);
   const oauthTimer = useRef<number | null>(null);
+  const oauthHostRef = useRef<string | null>(null);
 
   const host =
     hosts.find((candidate) => candidate.hostId === hostId) ?? hosts[0];
@@ -341,6 +342,9 @@ export default function App() {
     setFiles([]);
     setFileChanges({});
     setFilePreview(null);
+    setUsage(null);
+    setOauthFlow(null);
+    oauthHostRef.current = null;
     if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
     void (async () => {
       try {
@@ -988,16 +992,19 @@ export default function App() {
   }
 
   async function startKimiLogin() {
-    if (!channel) return;
+    if (!channel || !host) return;
+    const targetHostId = host.hostId;
+    oauthHostRef.current = targetHostId;
     try {
       const flow = await channel.rpc<OAuthFlow>("oauth.device.start", {});
+      if (oauthHostRef.current !== targetHostId) return;
       setOauthFlow(flow);
       if (flow.status === "authenticated") return void refreshUsage(channel);
       const destination =
         flow.verification_uri_complete ?? flow.verification_uri;
       if (destination)
         window.open(destination, "_blank", "noopener,noreferrer");
-      scheduleOAuthPoll(flow, channel);
+      scheduleOAuthPoll(flow, channel, targetHostId);
     } catch (nextError) {
       setError(
         nextError instanceof Error ? nextError.message : "Kimi 登录失败",
@@ -1005,8 +1012,13 @@ export default function App() {
     }
   }
 
-  function scheduleOAuthPoll(flow: OAuthFlow, activeChannel: RelayChannel) {
-    if (flow.status !== "pending") return;
+  function scheduleOAuthPoll(
+    flow: OAuthFlow,
+    activeChannel: RelayChannel,
+    targetHostId: string,
+  ) {
+    if (flow.status !== "pending" || oauthHostRef.current !== targetHostId)
+      return;
     oauthTimer.current = window.setTimeout(
       async () => {
         try {
@@ -1014,11 +1026,11 @@ export default function App() {
             "oauth.device.poll",
             {},
           );
-          if (!next) return;
+          if (!next || oauthHostRef.current !== targetHostId) return;
           setOauthFlow(next);
           if (next.status === "authenticated")
             await refreshUsage(activeChannel);
-          else scheduleOAuthPoll(next, activeChannel);
+          else scheduleOAuthPoll(next, activeChannel, targetHostId);
         } catch (nextError) {
           setError(
             nextError instanceof Error
