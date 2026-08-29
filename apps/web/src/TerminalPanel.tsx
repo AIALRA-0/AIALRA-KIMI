@@ -20,6 +20,25 @@ interface TerminalResumeState {
   resumeToken: string;
 }
 
+type TerminalShell = "powershell" | "cmd" | "shell";
+
+export function defaultShellForPlatform(
+  platform: "windows" | "linux",
+): TerminalShell {
+  return platform === "windows" ? "powershell" : "shell";
+}
+
+export function effectiveShellForPlatform(
+  platform: "windows" | "linux",
+  selected: TerminalShell,
+): TerminalShell {
+  return platform === "windows"
+    ? selected === "cmd"
+      ? "cmd"
+      : "powershell"
+    : "shell";
+}
+
 export function TerminalPanel({
   hostId,
   channel,
@@ -35,9 +54,10 @@ export function TerminalPanel({
   const credentialRef = useRef<{ username: string; password: string } | null>(
     null,
   );
-  const [shell, setShell] = useState(
-    platform === "windows" ? "PowerShell" : "Shell",
+  const [shell, setShell] = useState<TerminalShell>(() =>
+    defaultShellForPlatform(platform),
   );
+  const effectiveShell = effectiveShellForPlatform(platform, shell);
   const [adminUsername, setAdminUsername] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
   const [credentialAttempt, setCredentialAttempt] = useState(0);
@@ -67,7 +87,7 @@ export function TerminalPanel({
     activeTerminal.current = terminal;
     fit.fit();
     let ready = demo;
-    const resumeKey = `aialra-terminal:${hostId}:${shell.toLowerCase()}`;
+    const resumeKey = `aialra-terminal:${hostId}:${effectiveShell}`;
     if (demo) {
       terminal.writeln("AIALRA Kimi 安全终端");
       terminal.writeln(
@@ -104,7 +124,7 @@ export function TerminalPanel({
             terminalId: string;
             resumeToken: string;
           }>(elevated ? "terminal.elevate.open" : "terminal.open", {
-            shell: shell.toLowerCase(),
+            shell: effectiveShell,
             columns: terminal.cols,
             rows: terminal.rows,
             ...(credentials ?? {}),
@@ -166,7 +186,15 @@ export function TerminalPanel({
       activeTerminal.current = null;
       terminal.dispose();
     };
-  }, [channel, credentialAttempt, demo, elevated, hostId, platform, shell]);
+  }, [
+    channel,
+    credentialAttempt,
+    demo,
+    effectiveShell,
+    elevated,
+    hostId,
+    platform,
+  ]);
 
   useEffect(() => {
     if (output) activeTerminal.current?.write(output.data);
@@ -203,17 +231,17 @@ export function TerminalPanel({
           <i />
         </div>
         <select
-          value={shell}
-          onChange={(event) => setShell(event.target.value)}
+          value={effectiveShell}
+          onChange={(event) => setShell(event.target.value as TerminalShell)}
           aria-label="命令行环境"
         >
           {platform === "windows" ? (
             <>
-              <option>PowerShell</option>
-              <option>CMD</option>
+              <option value="powershell">PowerShell</option>
+              <option value="cmd">CMD</option>
             </>
           ) : (
-            <option>Shell</option>
+            <option value="shell">Shell</option>
           )}
         </select>
         {elevationAvailable ? (
