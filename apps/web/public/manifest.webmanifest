@@ -1,0 +1,17 @@
+{
+  "name": "AIALRA Kimi",
+  "short_name": "AIALRA Kimi",
+  "description": "私有的多主机 Kimi Code 控制台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0d0f",
+  "theme_color": "#0b0d0f",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

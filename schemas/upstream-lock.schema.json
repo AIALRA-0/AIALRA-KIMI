@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aialra.example/schemas/upstream-lock.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capturedAt",
+    "repository",
+    "package",
+    "version",
+    "tag",
+    "commit",
+    "license",
+    "releaseAssets",
+    "protocol"
+  ],
+  "properties": {
+    "capturedAt": { "type": "string", "format": "date-time" },
+    "repository": { "type": "string", "format": "uri" },
+    "package": { "const": "@moonshot-ai/kimi-code" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "tag": { "type": "string" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "license": { "const": "MIT" },
+    "releaseAssets": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["openapiSha256", "asyncapiSha256", "status"],
+      "properties": {
+        "openapiSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "asyncapiSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "status": { "const": "experimental" }
+      }
+    }
+  }
+}

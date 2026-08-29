@@ -1,0 +1,21 @@
+{
+  "$schema": "./schemas/upstream-lock.schema.json",
+  "capturedAt": "2026-08-29T02:25:00Z",
+  "repository": "https://github.com/MoonshotAI/kimi-code",
+  "package": "@moonshot-ai/kimi-code",
+  "version": "0.39.1",
+  "tag": "@moonshot-ai/kimi-code@0.39.1",
+  "commit": "5efca0c3116743855c28426000073bfe34a4862f",
+  "license": "MIT",
+  "releaseAssets": {
+    "linux-arm64": "e597d2092e35cd898dca98c6af8b0ea314090e9afcb7e27f03a4330d4f7a7fe3",
+    "linux-x64": "9c301ac70fa5d1f7c73a3138bae1b5664ccc05159b10c93e5eb87b3beea04c21",
+    "win32-arm64": "3cef980b1a59a4eb0021c3bc614b500e924715c036c10a130ac2183ed466221e",
+    "win32-x64": "4319be52b883c455320912954ee1e34f06417c9ac935a75326b4ee6a25587dc9"
+  },
+  "protocol": {
+    "openapiSha256": "3318ae440c81f36f95fcd8b52efede86dfafd7647a954b71bf7c1ac47cfd51ab",
+    "asyncapiSha256": "0a411bd64bf89f2442d7ae24052980890993f8e6794490cfca0b82d6e1bedf5e",
+    "status": "experimental"
+  }
+}

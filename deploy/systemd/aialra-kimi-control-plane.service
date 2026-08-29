@@ -1,0 +1,41 @@
+[Unit]
+Description=AIALRA-KIMI control plane
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=aialra-kimi
+Group=aialra-kimi
+WorkingDirectory=/opt/aialra-kimi/current/control-plane
+EnvironmentFile=/etc/aialra-kimi/control-plane.env
+Environment=DATABASE_KEY_FILE=%d/database_key
+Environment=SESSION_KEY_FILE=%d/session_key
+Environment=GRANT_SIGNING_PRIVATE_KEY_FILE=%d/grant_signing_key
+Environment=OIDC_CLIENT_SECRET_FILE=%d/oidc_client_secret
+Environment=OIDC_ELEVATION_CLIENT_SECRET_FILE=%d/elevation_oidc_client_secret
+LoadCredential=database_key:/etc/aialra-kimi/secrets/database_key
+LoadCredential=session_key:/etc/aialra-kimi/secrets/session_key
+LoadCredential=grant_signing_key:/etc/aialra-kimi/secrets/grant_signing_key
+LoadCredential=oidc_client_secret:/etc/aialra-kimi/secrets/oidc_client_secret
+LoadCredential=elevation_oidc_client_secret:/etc/aialra-kimi/secrets/elevation_oidc_client_secret
+ExecStart=/opt/aialra-kimi/node-v24.15.0-linux-x64/bin/node dist/main.js
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/aialra-kimi
+
+[Install]
+WantedBy=multi-user.target

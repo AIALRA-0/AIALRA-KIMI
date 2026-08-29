@@ -1,0 +1,18 @@
+[Unit]
+Description=AIALRA-KIMI outbound host agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/aialra-kimi-agent run
+Environment=KIMI_CODE_HOME=%h/.kimi-code
+Restart=always
+RestartSec=3
+UMask=0077
+PrivateTmp=true
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
