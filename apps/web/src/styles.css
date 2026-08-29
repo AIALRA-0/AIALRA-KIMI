@@ -1689,6 +1689,29 @@ button:disabled {
   border-radius: 10px;
   background: var(--panel);
 }
+
+.oauth-login-actions {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.oauth-login-actions label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.oauth-login-actions select {
+  min-width: 180px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 9px 32px 9px 10px;
+}
 .oauth-device strong {
   color: var(--text);
   font:

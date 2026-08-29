@@ -220,8 +220,12 @@ impl KimiClient {
             "oauth.userinfo" => self.data(Method::GET, "/api/v1/oauth/userinfo", None).await,
             "oauth.usage" => self.usage().await,
             "oauth.device.start" => {
-                self.data(Method::POST, "/api/v1/oauth/login", Some(json!({})))
-                    .await
+                self.data(
+                    Method::POST,
+                    "/api/v1/oauth/login",
+                    Some(oauth_login_body(&body)?),
+                )
+                .await
             }
             "oauth.device.poll" => self.data(Method::GET, "/api/v1/oauth/login", None).await,
             _ => bail!("operation is not allowed by the Kimi adapter"),
@@ -799,6 +803,17 @@ fn compact_json(value: Option<&Value>) -> String {
     }
 }
 
+fn oauth_login_body(value: &Value) -> Result<Value> {
+    let region = value
+        .get("region")
+        .and_then(Value::as_str)
+        .unwrap_or("mainland-cn");
+    if !matches!(region, "mainland-cn" | "global") {
+        bail!("unsupported Kimi OAuth region");
+    }
+    Ok(json!({ "region": region }))
+}
+
 fn workspace_alias(path: &str) -> String {
     let candidate = path
         .trim_end_matches(['/', '\\'])
@@ -889,6 +904,19 @@ mod tests {
         assert!(validate_path_segment("session_abc-123", "sessionId").is_ok());
         assert!(validate_path_segment("../oauth/usage", "sessionId").is_err());
         assert!(validate_path_segment("session%2Fadmin", "sessionId").is_err());
+    }
+
+    #[test]
+    fn defaults_kimi_oauth_to_mainland_and_rejects_unknown_regions() {
+        assert_eq!(
+            oauth_login_body(&json!({})).unwrap(),
+            json!({ "region": "mainland-cn" })
+        );
+        assert_eq!(
+            oauth_login_body(&json!({ "region": "global" })).unwrap(),
+            json!({ "region": "global" })
+        );
+        assert!(oauth_login_body(&json!({ "region": "unknown" })).is_err());
     }
 
     #[tokio::test]

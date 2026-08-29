@@ -62,6 +62,7 @@ import {
 } from "./session-model.js";
 
 type MainView = "conversation" | "terminal" | "account" | "settings";
+type KimiOAuthRegion = "mainland-cn" | "global";
 
 interface OAuthFlow {
   flow_id: string;
@@ -221,6 +222,8 @@ export default function App() {
   const [pairingOpen, setPairingOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [oauthFlow, setOauthFlow] = useState<OAuthFlow | null>(null);
+  const [oauthRegion, setOauthRegion] =
+    useState<KimiOAuthRegion>("mainland-cn");
   const [newSessionDefault, setNewSessionDefault] =
     useState<PermissionMode>("manual");
   const [reconnectGeneration, setReconnectGeneration] = useState(0);
@@ -1002,7 +1005,9 @@ export default function App() {
     const targetHostId = host.hostId;
     oauthHostRef.current = targetHostId;
     try {
-      const flow = await channel.rpc<OAuthFlow>("oauth.device.start", {});
+      const flow = await channel.rpc<OAuthFlow>("oauth.device.start", {
+        region: oauthRegion,
+      });
       if (oauthHostRef.current !== targetHostId) return;
       setOauthFlow(flow);
       if (flow.status === "authenticated") return void refreshUsage(channel);
@@ -1573,12 +1578,31 @@ export default function App() {
                     <div className="usage-error">
                       <span>{usage.upstreamError}</span>
                       {host?.state === "online" && (
-                        <button
-                          className="secondary-button"
-                          onClick={() => void startKimiLogin()}
-                        >
-                          登录 Kimi
-                        </button>
+                        <div className="oauth-login-actions">
+                          <label>
+                            账号地区
+                            <select
+                              aria-label="Kimi 账号地区"
+                              value={oauthRegion}
+                              onChange={(event) =>
+                                setOauthRegion(
+                                  event.target.value as KimiOAuthRegion,
+                                )
+                              }
+                            >
+                              <option value="mainland-cn">
+                                中国大陆（+86）
+                              </option>
+                              <option value="global">全球账号</option>
+                            </select>
+                          </label>
+                          <button
+                            className="secondary-button"
+                            onClick={() => void startKimiLogin()}
+                          >
+                            登录 Kimi
+                          </button>
+                        </div>
                       )}
                     </div>
                   )}
@@ -1642,12 +1666,27 @@ export default function App() {
                 <h2>暂时无法读取用量</h2>
                 <p>所选主机可能还没有登录官方 Kimi 账号</p>
                 {host?.state === "online" && (
-                  <button
-                    className="primary-button"
-                    onClick={() => void startKimiLogin()}
-                  >
-                    登录 Kimi
-                  </button>
+                  <div className="oauth-login-actions">
+                    <label>
+                      账号地区
+                      <select
+                        aria-label="Kimi 账号地区"
+                        value={oauthRegion}
+                        onChange={(event) =>
+                          setOauthRegion(event.target.value as KimiOAuthRegion)
+                        }
+                      >
+                        <option value="mainland-cn">中国大陆（+86）</option>
+                        <option value="global">全球账号</option>
+                      </select>
+                    </label>
+                    <button
+                      className="primary-button"
+                      onClick={() => void startKimiLogin()}
+                    >
+                      登录 Kimi
+                    </button>
+                  </div>
                 )}
                 {oauthFlow?.status === "pending" && (
                   <div className="oauth-device">
