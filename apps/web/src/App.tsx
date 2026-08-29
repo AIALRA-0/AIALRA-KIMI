@@ -1602,7 +1602,7 @@ export default function App() {
                             </select>
                           </label>
                           <button
-                            className="secondary-button"
+                            className="primary-button"
                             onClick={() => void startKimiLogin()}
                           >
                             授权此主机
