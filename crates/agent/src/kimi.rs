@@ -623,7 +623,7 @@ impl KimiClient {
         let id = take_required_path_segment(&mut body, "sessionId")?;
         self.data(
             Method::POST,
-            &format!("/api/v1/sessions/{id}/btw"),
+            &format!("/api/v1/sessions/{id}:btw"),
             Some(body),
         )
         .await
@@ -662,7 +662,9 @@ impl KimiClient {
                 Method::POST,
                 &format!("/api/v1/sessions/{id}/export"),
                 Some(json!({ "desktop": false })),
-                24 * 1024 * 1024,
+                // A 5 MiB archive remains below the 12 MiB encrypted relay frame
+                // after base64 and authenticated-encryption overhead.
+                5 * 1024 * 1024,
             )
             .await?;
         Ok(json!({
