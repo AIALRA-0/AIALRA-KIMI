@@ -503,7 +503,7 @@ export default function App() {
       }
     }
     void loadHosts();
-    const timer = window.setInterval(() => void loadHosts(), 10_000);
+    const timer = window.setInterval(() => void loadHosts(), 3_000);
     return () => {
       active = false;
       window.clearInterval(timer);
@@ -671,7 +671,13 @@ export default function App() {
   }, [channel, demo, sessionId]);
 
   useEffect(() => {
-    if (view !== "terminal" || demo || !host || host.state !== "online") return;
+    if (view !== "terminal" || demo || !host) return;
+    if (host.state !== "online") {
+      terminalChannel?.close();
+      setTerminalChannel(null);
+      setTerminalOutput(null);
+      return;
+    }
     let disposed = false;
     let opened: RelayChannel | null = null;
     terminalChannel?.close();
