@@ -35,6 +35,7 @@ export const RelayGrantBody = z.object({
 
 const HostPreferencesBody = z.object({
   defaultPermissionMode: PermissionModeSchema,
+  pinnedSessionIds: z.array(z.string().min(1).max(128)).max(5000).optional(),
 });
 
 export interface AppServices {
@@ -173,7 +174,13 @@ export async function createApp(config: AppConfig): Promise<AppServices> {
       .object({ hostId: z.string().min(8).max(128) })
       .parse(request.params);
     const body = HostPreferencesBody.parse(request.body);
-    if (!db.setHostPreferences(hostId, body.defaultPermissionMode)) {
+    if (
+      !db.setHostPreferences(
+        hostId,
+        body.defaultPermissionMode,
+        body.pinnedSessionIds,
+      )
+    ) {
       return reply.code(404).send({ error: "host_not_found" });
     }
     db.audit({

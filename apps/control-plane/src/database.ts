@@ -89,7 +89,8 @@ export class ControlPlaneDatabase {
         host_id TEXT PRIMARY KEY REFERENCES hosts(host_id) ON DELETE CASCADE,
         default_permission_mode TEXT NOT NULL CHECK (
           default_permission_mode IN ('manual', 'auto', 'yolo')
-        )
+        ),
+        pinned_session_ids_json TEXT NOT NULL DEFAULT '[]'
       );
       CREATE TABLE IF NOT EXISTS replay_nonces (
         nonce_hash TEXT PRIMARY KEY,
@@ -105,6 +106,17 @@ export class ControlPlaneDatabase {
         request_id TEXT NOT NULL
       );
     `);
+    const preferenceColumns = this.raw
+      .prepare("PRAGMA table_info(host_preferences)")
+      .all() as unknown as Array<{ name: string }>;
+    if (
+      !preferenceColumns.some(
+        (column) => column.name === "pinned_session_ids_json",
+      )
+    )
+      this.raw.exec(
+        "ALTER TABLE host_preferences ADD COLUMN pinned_session_ids_json TEXT NOT NULL DEFAULT '[]'",
+      );
   }
 
   storePairingCode(
@@ -236,31 +248,54 @@ export class ControlPlaneDatabase {
 
   getHostPreferences(hostId: string): {
     defaultPermissionMode: PermissionMode;
+    pinnedSessionIds: string[];
   } | null {
     const host = this.getHostIdentity(hostId);
     if (!host || host.revoked) return null;
     const row = this.raw
       .prepare(
-        "SELECT default_permission_mode FROM host_preferences WHERE host_id = ?",
+        "SELECT default_permission_mode, pinned_session_ids_json FROM host_preferences WHERE host_id = ?",
       )
-      .get(hostId) as { default_permission_mode: PermissionMode } | undefined;
-    return { defaultPermissionMode: row?.default_permission_mode ?? "manual" };
+      .get(hostId) as
+      | {
+          default_permission_mode: PermissionMode;
+          pinned_session_ids_json: string;
+        }
+      | undefined;
+    return {
+      defaultPermissionMode: row?.default_permission_mode ?? "manual",
+      pinnedSessionIds: row
+        ? (JSON.parse(row.pinned_session_ids_json) as string[])
+        : [],
+    };
   }
 
   setHostPreferences(
     hostId: string,
     defaultPermissionMode: PermissionMode,
+    pinnedSessionIds?: string[],
   ): boolean {
     const host = this.getHostIdentity(hostId);
     if (!host || host.revoked) return false;
     this.raw
       .prepare(
         `
-        INSERT INTO host_preferences(host_id, default_permission_mode) VALUES (?, ?)
-        ON CONFLICT(host_id) DO UPDATE SET default_permission_mode = excluded.default_permission_mode
+        INSERT INTO host_preferences(host_id, default_permission_mode, pinned_session_ids_json)
+        VALUES (?, ?, ?)
+        ON CONFLICT(host_id) DO UPDATE SET
+          default_permission_mode = excluded.default_permission_mode,
+          pinned_session_ids_json = CASE
+            WHEN ? THEN excluded.pinned_session_ids_json
+            ELSE host_preferences.pinned_session_ids_json
+          END
       `,
       )
-      .run(hostId, defaultPermissionMode);
+      .run(
+        hostId,
+        defaultPermissionMode,
+        JSON.stringify(pinnedSessionIds ?? []),
+        pinnedSessionIds !== undefined ? 1 : 0,
+      );
     return true;
   }
 

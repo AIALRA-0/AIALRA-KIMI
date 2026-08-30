@@ -119,10 +119,19 @@ describe("control-plane database", () => {
 
     expect(database.getHostPreferences("host-alpha")).toEqual({
       defaultPermissionMode: "manual",
+      pinnedSessionIds: [],
     });
-    expect(database.setHostPreferences("host-alpha", "yolo")).toBe(true);
+    expect(
+      database.setHostPreferences("host-alpha", "yolo", ["session-one"]),
+    ).toBe(true);
     expect(database.getHostPreferences("host-alpha")).toEqual({
       defaultPermissionMode: "yolo",
+      pinnedSessionIds: ["session-one"],
+    });
+    expect(database.setHostPreferences("host-alpha", "auto")).toBe(true);
+    expect(database.getHostPreferences("host-alpha")).toEqual({
+      defaultPermissionMode: "auto",
+      pinnedSessionIds: ["session-one"],
     });
   });
 });

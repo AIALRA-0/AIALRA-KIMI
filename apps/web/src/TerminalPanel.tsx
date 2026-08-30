@@ -265,7 +265,9 @@ export function TerminalPanel({
             <span>管理员会话</span>
           </label>
         ) : (
-          <span className="terminal-capability-note">管理员代理不可用</span>
+          <span className="terminal-capability-note">
+            普通终端已连接 · 管理员终端未启用
+          </span>
         )}
         {elevated && <span className="danger-chip">断开即终止</span>}
       </div>

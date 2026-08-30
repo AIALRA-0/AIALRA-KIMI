@@ -114,3 +114,40 @@ test("renders Markdown and collapses completed tool calls", async ({
   await expect(tool.getByText("health: ok")).toBeVisible();
   await expect(tool.getByText("<system>")).toHaveCount(0);
 });
+
+test("groups conversations by project and keeps composer choices stable", async ({
+  page,
+}) => {
+  await expect(page.getByText("nebula-console", { exact: true })).toBeVisible();
+  await expect(page.getByText("relay-lab", { exact: true })).toBeVisible();
+  const model = page.getByRole("combobox", { name: "模型" });
+  const thinking = page.getByRole("combobox", { name: "思考强度" });
+  await model.selectOption("kimi-code");
+  await thinking.selectOption("max");
+  await page.waitForTimeout(500);
+  await expect(model).toHaveValue("kimi-code");
+  await expect(thinking).toHaveValue("max");
+});
+
+test("folds and restores the desktop project tree", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name.startsWith("mobile"));
+  const sidebar = page.locator("aside.sidebar");
+  await expect(sidebar).toBeVisible();
+  await page.getByRole("button", { name: "折叠左侧栏" }).click();
+  await expect(sidebar).toBeHidden();
+  await page.getByRole("button", { name: "展开左侧栏" }).click();
+  await expect(sidebar).toBeVisible();
+});
+
+test("distinguishes the normal terminal from optional elevation", async ({
+  page,
+}, testInfo) => {
+  await openMobileNavigation(page, testInfo.project.name);
+  await page.getByRole("button", { name: "终端" }).click();
+  await expect(
+    page.getByText("普通终端已连接 · 管理员终端未启用"),
+  ).toBeVisible();
+  await expect(page.getByText("管理员代理不可用")).toHaveCount(0);
+});

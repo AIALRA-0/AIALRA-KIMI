@@ -119,6 +119,17 @@ select option {
   height: 100dvh;
   background: var(--bg);
 }
+.app-shell.sidebar-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr) 314px;
+}
+.app-shell.sidebar-collapsed.details-closed {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+.app-shell.sidebar-collapsed .sidebar {
+  visibility: hidden;
+  overflow: hidden;
+  border-right: 0;
+}
 
 .topbar {
   grid-area: top;
@@ -128,6 +139,10 @@ select option {
   background: color-mix(in srgb, var(--panel) 94%, transparent);
   padding: 0 14px 0 18px;
   z-index: 20;
+}
+.desktop-sidebar-toggle {
+  flex: none;
+  margin-right: 8px;
 }
 .brand {
   width: 255px;
@@ -275,8 +290,7 @@ select option {
   display: grid;
   gap: 3px;
 }
-.host-row,
-.session-row {
+.host-row {
   width: 100%;
   border: 0;
   text-align: left;
@@ -383,13 +397,34 @@ select option {
   scrollbar-width: thin;
   scrollbar-color: var(--line) transparent;
 }
+.project-group + .project-group {
+  margin-top: 10px;
+}
+.project-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  color: var(--dim);
+  font-size: 9px;
+}
+.project-heading strong {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-heading span {
+  font-variant-numeric: tabular-nums;
+}
 .session-row {
   position: relative;
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: 7px;
-  padding: 9px 8px;
+  display: flex;
+  align-items: center;
+  width: 100%;
   border-radius: 9px;
+  color: var(--muted);
 }
 .session-row:hover,
 .session-row.active {
@@ -408,25 +443,67 @@ select option {
 .session-status.waiting {
   color: var(--orange);
 }
-.session-row > span:nth-child(2) {
+.session-open {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 7px;
+  padding: 9px 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.session-open > span:nth-child(2) {
   display: flex;
   min-width: 0;
   flex-direction: column;
   gap: 4px;
 }
-.session-row strong {
+.session-open strong {
   overflow: hidden;
   font-size: 11px;
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-row small {
+.session-open small {
   overflow: hidden;
   color: var(--dim);
   font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.session-actions {
+  display: flex;
+  flex: none;
+  width: 0;
+  overflow: hidden;
+  opacity: 0;
+}
+.session-row:hover .session-actions,
+.session-row:focus-within .session-actions {
+  width: 72px;
+  opacity: 1;
+}
+.session-actions button {
+  display: grid;
+  width: 24px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  place-items: center;
+}
+.session-actions button:hover {
+  background: var(--panel-raised);
+  color: var(--text);
 }
 .unread-dot {
   position: absolute;
@@ -953,13 +1030,19 @@ select option {
   gap: 10px;
 }
 .composer-footer button:not(.send-button) {
-  display: flex;
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 5px;
+  min-height: 28px;
+  padding: 0 6px;
   border: 0;
+  border-radius: 7px;
   background: transparent;
   color: var(--muted);
-  font-size: 9px;
+  font-family: inherit;
+  font-size: 10px;
+  white-space: nowrap;
 }
 
 .composer-footer button.active {
@@ -968,14 +1051,16 @@ select option {
 }
 
 .composer-select {
-  width: auto;
+  width: 142px;
+  height: 28px;
   min-height: 28px;
   padding: 0 25px 0 8px;
   border-color: transparent;
   border-radius: 7px;
   background-color: transparent;
   background-position: right 7px center;
-  font-size: 11px;
+  font-family: inherit;
+  font-size: 10px;
 }
 
 .composer-select:hover,
@@ -985,11 +1070,11 @@ select option {
 }
 
 .model-select {
-  max-width: 150px;
+  width: 142px;
 }
 
 .thinking-select {
-  max-width: 96px;
+  width: 104px;
 }
 .composer-footer span {
   color: var(--dim);
@@ -2440,6 +2525,11 @@ button:disabled {
     grid-template-columns: 250px minmax(0, 1fr);
     grid-template-areas: "top top" "side main";
   }
+  .app-shell.sidebar-collapsed,
+  .app-shell.sidebar-collapsed.details-closed {
+    grid-template-columns: 0 minmax(0, 1fr);
+    grid-template-areas: "top top" "side main";
+  }
   .details-panel {
     display: none;
   }
@@ -2453,9 +2543,14 @@ button:disabled {
     display: grid;
   }
   .app-shell,
-  .app-shell.details-closed {
+  .app-shell.details-closed,
+  .app-shell.sidebar-collapsed,
+  .app-shell.sidebar-collapsed.details-closed {
     grid-template: 54px 1fr / 1fr;
     grid-template-areas: "top" "main";
+  }
+  .desktop-sidebar-toggle {
+    display: none;
   }
   .topbar {
     padding: 0 10px;

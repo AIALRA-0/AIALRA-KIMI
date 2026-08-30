@@ -105,20 +105,22 @@ export const api = {
       "/api/v1/elevation/status",
     ),
   hostPreferences: (hostId: string) =>
-    request<{ defaultPermissionMode: PermissionMode }>(
-      `/api/v1/hosts/${encodeURIComponent(hostId)}/preferences`,
-    ),
+    request<{
+      defaultPermissionMode: PermissionMode;
+      pinnedSessionIds: string[];
+    }>(`/api/v1/hosts/${encodeURIComponent(hostId)}/preferences`),
   updateHostPreferences: (
     hostId: string,
     defaultPermissionMode: PermissionMode,
+    pinnedSessionIds?: string[],
   ) =>
-    request<{ defaultPermissionMode: PermissionMode }>(
-      `/api/v1/hosts/${encodeURIComponent(hostId)}/preferences`,
-      {
-        method: "PUT",
-        body: JSON.stringify({ defaultPermissionMode }),
-      },
-    ),
+    request<{
+      defaultPermissionMode: PermissionMode;
+      pinnedSessionIds?: string[];
+    }>(`/api/v1/hosts/${encodeURIComponent(hostId)}/preferences`, {
+      method: "PUT",
+      body: JSON.stringify({ defaultPermissionMode, pinnedSessionIds }),
+    }),
 };
 
 export function csrfToken(): string {

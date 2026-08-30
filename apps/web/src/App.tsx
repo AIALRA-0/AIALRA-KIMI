@@ -10,8 +10,13 @@ import {
   Menu,
   MessageSquare,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRightClose,
   Paperclip,
+  Pencil,
+  Pin,
+  PinOff,
   Plus,
   Search,
   Send,
@@ -223,6 +228,25 @@ function matchesPermission(value: string): value is PermissionMode {
   return value === "manual" || value === "auto" || value === "yolo";
 }
 
+function loadPinnedSessions(): Set<string> {
+  try {
+    const value = JSON.parse(
+      localStorage.getItem("aialra-pinned-sessions") ?? "[]",
+    );
+    return new Set(
+      Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === "string")
+        : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function waitFor(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 export default function App() {
   const demo =
     import.meta.env.VITE_DEMO_MODE === "1" ||
@@ -287,14 +311,17 @@ export default function App() {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [sending, setSending] = useState(false);
   const [modelOptions, setModelOptions] = useState<ModelDescriptor[]>([]);
-  const [selectedModel, setSelectedModel] = useState("");
-  const [thinkingLevel, setThinkingLevel] = useState("");
+  const [selectedModel, setSelectedModel] = useState(demo ? "kimi-code" : "");
+  const [thinkingLevel, setThinkingLevel] = useState(demo ? "high" : "");
   const [planMode, setPlanMode] = useState(false);
   const [commands, setCommands] =
     useState<CommandDescriptor[]>(BUILTIN_COMMANDS);
   const [commandSelection, setCommandSelection] = useState(0);
   const [fileSelection, setFileSelection] = useState(0);
   const [mobileNav, setMobileNav] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem("aialra-sidebar-collapsed") === "1",
+  );
   const [rightPanel, setRightPanel] = useState(true);
   const [elevated, setElevated] = useState(false);
   const [authRequired, setAuthRequired] = useState(false);
@@ -323,6 +350,11 @@ export default function App() {
   const browserReconnectTimer = useRef<number | null>(null);
   const transcriptRetryAttemptRef = useRef(0);
   const transcriptRetryTimer = useRef<number | null>(null);
+  const composerDraftRef = useRef(
+    new Map<string, { model: string; thinkingLevel: string }>(),
+  );
+  const [pinnedSessionIds, setPinnedSessionIds] =
+    useState<Set<string>>(loadPinnedSessions);
 
   const host =
     hosts.find((candidate) => candidate.hostId === hostId) ?? hosts[0];
@@ -338,6 +370,34 @@ export default function App() {
       ),
     [query, sessions],
   );
+  const projectGroups = useMemo(() => {
+    const groups = new Map<string, UiSession[]>();
+    for (const item of filteredSessions) {
+      const project = item.workspaceAlias || "未命名项目";
+      const group = groups.get(project) ?? [];
+      group.push(item);
+      groups.set(project, group);
+    }
+    return [...groups.entries()]
+      .map(([project, items]) => ({
+        project,
+        items: [...items].sort((left, right) => {
+          const leftPinned = pinnedSessionIds.has(left.upstreamSessionId)
+            ? 1
+            : 0;
+          const rightPinned = pinnedSessionIds.has(right.upstreamSessionId)
+            ? 1
+            : 0;
+          if (leftPinned !== rightPinned) return rightPinned - leftPinned;
+          return (
+            Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? "")
+          );
+        }),
+      }))
+      .sort((left, right) =>
+        left.project.localeCompare(right.project, "zh-CN"),
+      );
+  }, [filteredSessions, pinnedSessionIds]);
   const promptQueue = useMemo(
     () =>
       transcript
@@ -359,6 +419,20 @@ export default function App() {
   useEffect(() => {
     if (!demo && hostId) localStorage.setItem("aialra-selected-host", hostId);
   }, [demo, hostId]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "aialra-sidebar-collapsed",
+      sidebarCollapsed ? "1" : "0",
+    );
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "aialra-pinned-sessions",
+      JSON.stringify([...pinnedSessionIds]),
+    );
+  }, [pinnedSessionIds]);
 
   useEffect(() => {
     if (demo) return;
@@ -384,7 +458,10 @@ export default function App() {
     void api
       .hostPreferences(host.hostId)
       .then((preferences) => {
-        if (active) setNewSessionDefault(preferences.defaultPermissionMode);
+        if (active) {
+          setNewSessionDefault(preferences.defaultPermissionMode);
+          setPinnedSessionIds(new Set(preferences.pinnedSessionIds));
+        }
       })
       .catch((nextError) => {
         if (active)
@@ -991,8 +1068,11 @@ export default function App() {
       setQuestions(snapshot.pendingQuestions ?? []);
       setTasks(snapshot.tasks ?? []);
       setSessionStatus(snapshot.status);
-      setSelectedModel(snapshot.status.model ?? "");
-      setThinkingLevel(snapshot.status.thinkingLevel ?? "");
+      const composerDraft = composerDraftRef.current.get(targetSessionId);
+      setSelectedModel(composerDraft?.model ?? snapshot.status.model ?? "");
+      setThinkingLevel(
+        composerDraft?.thinkingLevel ?? snapshot.status.thinkingLevel ?? "",
+      );
       setFiles(fileResult.items ?? []);
       setFileChanges(gitResult.entries ?? {});
       setError(null);
@@ -1499,22 +1579,104 @@ export default function App() {
     }
   }
 
-  async function archiveSession() {
-    if (!channel || !session) return;
+  async function archiveSession(target = session) {
+    if (!channel || !target) return;
     setActionBusy(true);
     try {
       await channel.rpc("sessions.archive", {
-        sessionId: session.upstreamSessionId,
+        sessionId: target.upstreamSessionId,
       });
-      const remaining = sessions.filter(
-        (item) => item.upstreamSessionId !== session.upstreamSessionId,
+      let verified = await channel.rpc<{ sessions: UiSession[] }>(
+        "sessions.list",
       );
-      setSessions(remaining);
-      setSessionId(remaining[0]?.upstreamSessionId ?? "");
+      for (const delay of [150, 400, 900]) {
+        if (
+          !verified.sessions.some(
+            (item) => item.upstreamSessionId === target.upstreamSessionId,
+          )
+        )
+          break;
+        await waitFor(delay);
+        verified = await channel.rpc<{ sessions: UiSession[] }>(
+          "sessions.list",
+        );
+      }
+      if (
+        verified.sessions.some(
+          (item) => item.upstreamSessionId === target.upstreamSessionId,
+        )
+      )
+        throw new Error("上游尚未确认归档，请稍后重试");
+      setSessions(verified.sessions);
+      setSessionId((current) =>
+        current === target.upstreamSessionId
+          ? (verified.sessions[0]?.upstreamSessionId ?? "")
+          : current,
+      );
+      setPinnedSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(target.upstreamSessionId);
+        if (host && !demo)
+          void api
+            .updateHostPreferences(host.hostId, newSessionDefault, [...next])
+            .catch(() => undefined);
+        return next;
+      });
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "归档会话失败");
     } finally {
       setActionBusy(false);
+    }
+  }
+
+  async function renameSession(target: UiSession) {
+    if (!channel) return;
+    const title = window.prompt("输入新的对话名称", target.title)?.trim();
+    if (!title || title === target.title) return;
+    setActionBusy(true);
+    try {
+      await channel.rpc("sessions.title.write", {
+        sessionId: target.upstreamSessionId,
+        title,
+      });
+      const verified = await channel.rpc<{ sessions: UiSession[] }>(
+        "sessions.list",
+      );
+      const updated = verified.sessions.find(
+        (item) => item.upstreamSessionId === target.upstreamSessionId,
+      );
+      if (!updated || updated.title !== title)
+        throw new Error("上游尚未确认新名称，请稍后重试");
+      setSessions(verified.sessions);
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error ? nextError.message : "重命名对话失败",
+      );
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function togglePinnedSession(target: UiSession) {
+    const previous = pinnedSessionIds;
+    const next = new Set(previous);
+    if (next.has(target.upstreamSessionId))
+      next.delete(target.upstreamSessionId);
+    else next.add(target.upstreamSessionId);
+    setPinnedSessionIds(next);
+    if (!host || demo) return;
+    try {
+      const actual = await api.updateHostPreferences(
+        host.hostId,
+        newSessionDefault,
+        [...next],
+      );
+      setPinnedSessionIds(new Set(actual.pinnedSessionIds ?? [...next]));
+    } catch (nextError) {
+      setPinnedSessionIds(previous);
+      setError(
+        nextError instanceof Error ? nextError.message : "更新置顶状态失败",
+      );
     }
   }
 
@@ -1752,7 +1914,7 @@ export default function App() {
 
   return (
     <div
-      className={`app-shell ${rightPanel && view === "conversation" && session ? "" : "details-closed"}`}
+      className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${rightPanel && view === "conversation" && session ? "" : "details-closed"}`}
     >
       <header className="topbar">
         <button
@@ -1761,6 +1923,18 @@ export default function App() {
           aria-label="打开导航"
         >
           <Menu size={19} />
+        </button>
+        <button
+          className="icon-button desktop-sidebar-toggle"
+          onClick={() => setSidebarCollapsed((value) => !value)}
+          aria-label={sidebarCollapsed ? "展开左侧栏" : "折叠左侧栏"}
+          title={sidebarCollapsed ? "展开左侧栏" : "折叠左侧栏"}
+        >
+          {sidebarCollapsed ? (
+            <PanelLeftOpen size={18} />
+          ) : (
+            <PanelLeftClose size={18} />
+          )}
         </button>
         <div className="brand">
           <div className="brand-mark">K</div>
@@ -1778,7 +1952,8 @@ export default function App() {
           <button
             className="icon-button"
             onClick={() => setRightPanel((value) => !value)}
-            aria-label="切换详情面板"
+            aria-label={rightPanel ? "收起详情面板" : "展开详情面板"}
+            title={rightPanel ? "收起详情面板" : "展开详情面板"}
           >
             <PanelRightClose size={18} />
           </button>
@@ -1866,27 +2041,65 @@ export default function App() {
             />
           </label>
           <div className="session-list">
-            {filteredSessions.map((item) => (
-              <button
-                key={`${item.hostId}:${item.upstreamSessionId}`}
-                className={`session-row ${item.upstreamSessionId === session?.upstreamSessionId ? "active" : ""}`}
-                onClick={() => {
-                  setSessionId(item.upstreamSessionId);
-                  setView("conversation");
-                  setMobileNav(false);
-                }}
-              >
-                <span className={`session-status ${item.state}`}>
-                  <CircleDot size={13} />
-                </span>
-                <span>
-                  <strong>{item.title}</strong>
-                  <small>
-                    {item.workspaceAlias} · {relativeTime(item.updatedAt)}
-                  </small>
-                </span>
-                {item.unread && <i className="unread-dot" />}
-              </button>
+            {projectGroups.map(({ project, items }) => (
+              <section className="project-group" key={project}>
+                <div className="project-heading">
+                  <strong>{project}</strong>
+                  <span>{items.length}</span>
+                </div>
+                {items.map((item) => {
+                  const pinned = pinnedSessionIds.has(item.upstreamSessionId);
+                  return (
+                    <div
+                      key={`${item.hostId}:${item.upstreamSessionId}`}
+                      className={`session-row ${item.upstreamSessionId === session?.upstreamSessionId ? "active" : ""}`}
+                    >
+                      <button
+                        className="session-open"
+                        onClick={() => {
+                          setSessionId(item.upstreamSessionId);
+                          setView("conversation");
+                          setMobileNav(false);
+                        }}
+                      >
+                        <span className={`session-status ${item.state}`}>
+                          <CircleDot size={13} />
+                        </span>
+                        <span>
+                          <strong>{item.title}</strong>
+                          <small>{relativeTime(item.updatedAt)}</small>
+                        </span>
+                      </button>
+                      <div className="session-actions">
+                        <button
+                          title={pinned ? "取消置顶" : "置顶对话"}
+                          aria-label={pinned ? "取消置顶" : "置顶对话"}
+                          onClick={() => void togglePinnedSession(item)}
+                        >
+                          {pinned ? <PinOff size={13} /> : <Pin size={13} />}
+                        </button>
+                        <button
+                          title="重命名对话"
+                          aria-label="重命名对话"
+                          disabled={actionBusy}
+                          onClick={() => void renameSession(item)}
+                        >
+                          <Pencil size={13} />
+                        </button>
+                        <button
+                          title="归档对话"
+                          aria-label="归档对话"
+                          disabled={actionBusy}
+                          onClick={() => void archiveSession(item)}
+                        >
+                          <Archive size={13} />
+                        </button>
+                      </div>
+                      {item.unread && <i className="unread-dot" />}
+                    </div>
+                  );
+                })}
+              </section>
             ))}
             {!filteredSessions.length && (
               <p className="empty-list">此主机还没有会话</p>
@@ -2331,7 +2544,15 @@ export default function App() {
                       value={selectedModel}
                       title="本条消息使用的模型"
                       aria-label="模型"
-                      onChange={(event) => setSelectedModel(event.target.value)}
+                      onChange={(event) => {
+                        const model = event.target.value;
+                        setSelectedModel(model);
+                        if (session)
+                          composerDraftRef.current.set(
+                            session.upstreamSessionId,
+                            { model, thinkingLevel },
+                          );
+                      }}
                     >
                       {modelOptions.length === 0 && (
                         <option value={selectedModel}>
@@ -2349,7 +2570,18 @@ export default function App() {
                       value={thinkingLevel}
                       title="思考强度"
                       aria-label="思考强度"
-                      onChange={(event) => setThinkingLevel(event.target.value)}
+                      onChange={(event) => {
+                        const nextThinkingLevel = event.target.value;
+                        setThinkingLevel(nextThinkingLevel);
+                        if (session)
+                          composerDraftRef.current.set(
+                            session.upstreamSessionId,
+                            {
+                              model: selectedModel,
+                              thinkingLevel: nextThinkingLevel,
+                            },
+                          );
+                      }}
                     >
                       <option value="">默认思考</option>
                       {supportedEfforts(
@@ -2443,9 +2675,7 @@ export default function App() {
               channel={terminalChannel}
               demo={demo}
               platform={host.platform}
-              elevationAvailable={
-                demo || host.capabilities.includes("elevation")
-              }
+              elevationAvailable={host.capabilities.includes("elevation")}
               elevated={elevated}
               output={terminalOutput}
               onElevatedChange={(next) => void changeElevation(next)}
