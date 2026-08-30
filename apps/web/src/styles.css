@@ -1110,8 +1110,14 @@ button {
 .account-view {
   overflow: auto;
 }
+.account-content {
+  width: min(100%, 1200px);
+  display: grid;
+  gap: 16px;
+  margin: 0 auto;
+  padding: 24px clamp(24px, 3vw, 32px) 32px;
+}
 .account-card {
-  margin: 24px;
   padding: 20px;
   border: 1px solid var(--line);
   border-radius: 13px;
@@ -1178,7 +1184,6 @@ button {
   display: flex;
   align-items: flex-start;
   gap: 11px;
-  margin: 0 24px;
   padding: 14px;
   border: 1px solid color-mix(in srgb, var(--green) 22%, var(--line));
   border-radius: 11px;
@@ -1552,30 +1557,6 @@ button:disabled {
   color: var(--text);
   font-size: 9px;
 }
-.usage-error {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 12px;
-  margin-top: 16px;
-  padding: 14px;
-  border: 1px solid color-mix(in srgb, var(--orange) 28%, var(--line));
-  border-radius: 9px;
-  color: var(--orange);
-  font-size: 9px;
-}
-
-.usage-error span {
-  min-width: 0;
-  align-self: center;
-  overflow-wrap: anywhere;
-  line-height: 1.55;
-}
-
-.usage-error .oauth-login-actions {
-  flex-wrap: nowrap;
-}
-
 .terminal-loading {
   min-height: 420px;
   display: grid;
@@ -1687,22 +1668,39 @@ button:disabled {
   color: var(--muted);
   font-size: 0.74rem;
 }
-.oauth-device {
-  display: grid;
-  gap: 7px;
-  margin-top: 18px;
-  padding: 14px;
+.kimi-oauth-panel {
+  padding: 20px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 13px;
   background: var(--panel);
+}
+
+.kimi-oauth-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 24px;
+}
+
+.kimi-oauth-summary .eyebrow {
+  margin: 0 0 7px;
+}
+.kimi-oauth-summary h2 {
+  margin: 0 0 7px;
+  font-size: 16px;
+}
+.kimi-oauth-summary p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .oauth-login-actions {
   display: flex;
   align-items: flex-end;
-  justify-content: center;
+  justify-content: flex-end;
   gap: 12px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .oauth-login-actions label {
@@ -1714,7 +1712,7 @@ button:disabled {
 
 .oauth-login-actions select {
   min-width: 180px;
-  height: 38px;
+  height: 40px;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   background: var(--panel);
@@ -1723,28 +1721,37 @@ button:disabled {
 }
 
 .oauth-login-actions button {
-  min-height: 38px;
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
   white-space: nowrap;
 }
 
-@media (max-width: 760px) {
-  .usage-error {
-    grid-template-columns: 1fr;
-    align-items: stretch;
-  }
-
-  .usage-error .oauth-login-actions {
-    align-items: stretch;
-    justify-content: stretch;
-  }
-
-  .usage-error .oauth-login-actions label,
-  .usage-error .oauth-login-actions select,
-  .usage-error .oauth-login-actions button {
-    width: 100%;
-  }
+.oauth-device {
+  display: grid;
+  gap: 16px;
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
 }
-.oauth-device strong {
+
+.oauth-code-block {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-raised);
+}
+
+.oauth-code-block span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.oauth-code-block strong {
   color: var(--text);
   font:
     700 18px/1.2 "Cascadia Mono",
@@ -1753,13 +1760,77 @@ button:disabled {
     monospace;
   letter-spacing: 0.08em;
 }
-.oauth-device span,
-.oauth-device a {
-  color: var(--muted);
-  font-size: 10px;
+
+.oauth-warning {
+  margin: 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--text);
+  background: var(--panel-raised);
+  color: var(--text);
+  font-size: 12px;
 }
-.oauth-device a {
-  color: var(--blue);
+.oauth-steps {
+  display: grid;
+  gap: 10px;
+}
+.oauth-step {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.oauth-step > span:first-child {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  color: var(--text);
+  font-weight: 700;
+}
+.oauth-step-copy {
+  display: grid;
+  gap: 4px;
+}
+.oauth-step-copy strong {
+  font-size: 12px;
+}
+.oauth-step-copy span,
+.oauth-result span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.oauth-step .primary-button,
+.oauth-step .secondary-action,
+.oauth-global-action {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.secondary-action {
+  border: 1px solid var(--line-strong);
+  color: var(--text);
+  background: transparent;
+}
+.oauth-result {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.oauth-result strong {
+  font-size: 12px;
 }
 
 .dialog-scrim {
@@ -2034,8 +2105,12 @@ button:disabled {
   .danger-chip {
     display: none;
   }
+  .account-content {
+    gap: 12px;
+    padding: 15px;
+  }
   .account-card {
-    margin: 15px;
+    margin: 0;
     padding: 15px;
   }
   .usage-grid {
@@ -2043,7 +2118,31 @@ button:disabled {
     gap: 20px;
   }
   .data-boundary {
-    margin: 0 15px 20px;
+    margin: 0;
+  }
+  .kimi-oauth-summary {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  .oauth-login-actions {
+    align-items: stretch;
+    justify-content: stretch;
+    flex-direction: column;
+  }
+  .oauth-login-actions label,
+  .oauth-login-actions select,
+  .oauth-login-actions button {
+    width: 100%;
+  }
+  .oauth-step {
+    grid-template-columns: 30px minmax(0, 1fr);
+    align-items: start;
+  }
+  .oauth-step .primary-button,
+  .oauth-step .secondary-action,
+  .oauth-global-action {
+    grid-column: 1 / -1;
+    width: 100%;
   }
   .settings-view {
     padding: 15px;

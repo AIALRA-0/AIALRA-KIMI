@@ -40,6 +40,12 @@ import {
   type UiSession,
 } from "./demo.js";
 import { InteractionCards } from "./InteractionCards.js";
+import {
+  allowedKimiVerificationUrl,
+  KimiOAuthPanel,
+  type KimiOAuthRegion,
+  type OAuthFlow,
+} from "./KimiOAuthPanel.js";
 import { MarkdownMessage, ToolMessage } from "./MessageBody.js";
 import { NewSessionDialog, type NewSessionInput } from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
@@ -62,18 +68,6 @@ import {
 } from "./session-model.js";
 
 type MainView = "conversation" | "terminal" | "account" | "settings";
-type KimiOAuthRegion = "mainland-cn" | "global";
-
-interface OAuthFlow {
-  flow_id: string;
-  status: "pending" | "authenticated" | "denied" | "expired" | "cancelled";
-  verification_uri?: string;
-  verification_uri_complete?: string;
-  user_code?: string;
-  expires_at?: string;
-  interval?: number;
-  error_message?: string;
-}
 
 const relay = new BrowserRelay();
 const kimiScopes = [
@@ -1018,9 +1012,10 @@ export default function App() {
       if (oauthHostRef.current !== targetHostId) return;
       setOauthFlow(flow);
       if (flow.status === "authenticated") return void refreshUsage(channel);
-      const destination =
-        flow.verification_uri_complete ?? flow.verification_uri;
-      if (destination)
+      const destination = allowedKimiVerificationUrl(
+        flow.verification_uri_complete ?? flow.verification_uri,
+      );
+      if (oauthRegion === "global" && destination)
         window.open(destination, "_blank", "noopener,noreferrer");
       scheduleOAuthPoll(flow, channel, targetHostId);
     } catch (nextError) {
@@ -1569,8 +1564,8 @@ export default function App() {
                 更新于 {usage ? relativeTime(usage.capturedAt) : "从未"}
               </span>
             </div>
-            {usage ? (
-              <>
+            <div className="account-content">
+              {usage && (
                 <section className="account-card">
                   <div className="account-identity">
                     <div className="account-orb">
@@ -1581,161 +1576,68 @@ export default function App() {
                       <span>{usage.planLabel ?? "Kimi 账号"}</span>
                     </div>
                   </div>
-                  {usage.upstreamError && (
-                    <div className="usage-error">
-                      <span>{usageErrorText(usage.upstreamError)}</span>
-                      {host?.state === "online" && (
-                        <div className="oauth-login-actions">
-                          <label>
-                            账号地区
-                            <select
-                              aria-label="Kimi 账号地区"
-                              value={oauthRegion}
-                              onChange={(event) =>
-                                setOauthRegion(
-                                  event.target.value as KimiOAuthRegion,
-                                )
-                              }
-                            >
-                              <option value="mainland-cn">中国大陆账号</option>
-                              <option value="global">全球账号</option>
-                            </select>
-                          </label>
-                          <button
-                            className="primary-button"
-                            onClick={() => void startKimiLogin()}
-                          >
-                            授权此主机
-                          </button>
-                        </div>
-                      )}
+                  {usage.windows.length > 0 && (
+                    <div className="usage-grid">
+                      {usage.windows.map((window) => {
+                        const percent = window.limit
+                          ? Math.min(100, (window.used / window.limit) * 100)
+                          : 0;
+                        return (
+                          <div className="usage-meter" key={window.label}>
+                            <div>
+                              <strong>{window.label}</strong>
+                              <span>
+                                {window.used}
+                                {window.unit} 已用
+                              </span>
+                            </div>
+                            <div className="meter-track">
+                              <i style={{ width: `${percent}%` }} />
+                            </div>
+                            <small>
+                              重置时间{" "}
+                              {window.resetAt
+                                ? new Date(window.resetAt).toLocaleString(
+                                    "zh-CN",
+                                  )
+                                : "等待官方返回"}
+                            </small>
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
-                  <div className="usage-grid">
-                    {usage.windows.map((window) => {
-                      const percent = window.limit
-                        ? Math.min(100, (window.used / window.limit) * 100)
-                        : 0;
-                      return (
-                        <div className="usage-meter" key={window.label}>
-                          <div>
-                            <strong>{window.label}</strong>
-                            <span>
-                              {window.used}
-                              {window.unit} 已用
-                            </span>
-                          </div>
-                          <div className="meter-track">
-                            <i style={{ width: `${percent}%` }} />
-                          </div>
-                          <small>
-                            重置时间{" "}
-                            {window.resetAt
-                              ? new Date(window.resetAt).toLocaleString("zh-CN")
-                              : "等待官方返回"}
-                          </small>
-                        </div>
-                      );
-                    })}
-                  </div>
                 </section>
-                <div className="data-boundary">
-                  <ShieldCheck size={20} />
-                  <div>
-                    <strong>令牌只保留在 {host?.displayName}</strong>
-                    <p>
-                      此页面由所选主机读取官方用量，OAuth
-                      凭据不会进入浏览器或控制平面
-                    </p>
-                  </div>
+              )}
+
+              {(!usage || usage.upstreamError || oauthFlow) && (
+                <KimiOAuthPanel
+                  online={host?.state === "online"}
+                  region={oauthRegion}
+                  flow={oauthFlow}
+                  message={
+                    usage?.upstreamError
+                      ? usageErrorText(usage.upstreamError)
+                      : "所选主机尚未登录官方 Kimi 账号"
+                  }
+                  onRegionChange={setOauthRegion}
+                  onStart={() => void startKimiLogin()}
+                />
+              )}
+
+              <div className="data-boundary">
+                <ShieldCheck size={20} />
+                <div>
+                  <strong>
+                    令牌只保留在 {host?.displayName ?? "所选主机"}
+                  </strong>
+                  <p>
+                    此页面由所选主机读取官方用量，OAuth
+                    凭据不会进入浏览器或控制平面
+                  </p>
                 </div>
-                {oauthFlow?.status === "pending" && (
-                  <div className="oauth-device">
-                    <strong>验证码 {oauthFlow.user_code}</strong>
-                    <span>请先登录 Kimi 官网，再继续授权这台主机</span>
-                    {oauthRegion === "mainland-cn" && (
-                      <a
-                        href="https://www.kimi.com/code"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        使用中国大陆手机号登录 Kimi 官网
-                      </a>
-                    )}
-                    {oauthFlow.verification_uri_complete && (
-                      <a
-                        href={oauthFlow.verification_uri_complete}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        继续授权此主机
-                      </a>
-                    )}
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="offline-state">
-                <Gauge size={28} />
-                <h2>暂时无法读取用量</h2>
-                <p>所选主机可能还没有登录官方 Kimi 账号</p>
-                {host?.state === "online" && (
-                  <div className="oauth-login-actions">
-                    <label>
-                      账号地区
-                      <select
-                        aria-label="Kimi 账号地区"
-                        value={oauthRegion}
-                        onChange={(event) =>
-                          setOauthRegion(event.target.value as KimiOAuthRegion)
-                        }
-                      >
-                        <option value="mainland-cn">中国大陆账号</option>
-                        <option value="global">全球账号</option>
-                      </select>
-                    </label>
-                    <button
-                      className="primary-button"
-                      onClick={() => void startKimiLogin()}
-                    >
-                      授权此主机
-                    </button>
-                  </div>
-                )}
-                {oauthFlow?.status === "pending" && (
-                  <div className="oauth-device">
-                    <strong>验证码 {oauthFlow.user_code}</strong>
-                    <span>请先登录 Kimi 官网，再继续授权这台主机</span>
-                    {oauthRegion === "mainland-cn" && (
-                      <a
-                        href="https://www.kimi.com/code"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        使用中国大陆手机号登录 Kimi 官网
-                      </a>
-                    )}
-                    {oauthFlow.verification_uri_complete && (
-                      <a
-                        href={oauthFlow.verification_uri_complete}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        继续授权此主机
-                      </a>
-                    )}
-                  </div>
-                )}
-                {oauthFlow &&
-                  oauthFlow.status !== "pending" &&
-                  oauthFlow.status !== "authenticated" && (
-                    <p>
-                      {oauthFlow.error_message ??
-                        `登录状态：${oauthFlow.status}`}
-                    </p>
-                  )}
               </div>
-            )}
+            </div>
           </div>
         )}
 
