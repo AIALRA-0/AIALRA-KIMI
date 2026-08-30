@@ -24,9 +24,12 @@ const PairingBody = z.object({
   mode: HostModeSchema,
 });
 
-const RelayGrantBody = z.object({
+export const RelayGrantBody = z.object({
   hostId: z.string().min(8).max(128),
-  scopes: z.array(z.enum(AGENT_OPERATIONS)).min(1).max(32),
+  // The enum itself is the authority boundary. Keep the list bound tied to
+  // that allowlist so adding safe, explicit RPC operations cannot make the
+  // browser's least-privilege grant structurally invalid.
+  scopes: z.array(z.enum(AGENT_OPERATIONS)).min(1).max(AGENT_OPERATIONS.length),
   ttlSeconds: z.number().int().min(15).max(300).default(60),
 });
 
