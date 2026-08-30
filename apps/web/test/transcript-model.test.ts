@@ -1,0 +1,110 @@
+import { describe, expect, it } from "vitest";
+import {
+  applyTranscriptOps,
+  transcriptFromPage,
+  type TranscriptPage,
+} from "../src/transcript-model.js";
+
+function page(): TranscriptPage {
+  return {
+    agent_id: "main",
+    items: [
+      {
+        kind: "turn",
+        turnId: "turn-1",
+        ordinal: 1,
+        state: "running",
+        origin: { kind: "user" },
+        prompt: "测试",
+        steps: [
+          {
+            kind: "step",
+            stepId: "step-1",
+            turnId: "turn-1",
+            ordinal: 1,
+            state: "running",
+            frames: [
+              {
+                kind: "thinking",
+                frameId: "think-1",
+                text: "先分析",
+              },
+              {
+                kind: "text",
+                frameId: "answer-1",
+                role: "assistant",
+                text: "答",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    has_more: false,
+    tasks: [],
+    interactions: [],
+    attachments: [],
+    todos: [],
+    prompts: [],
+    meta: {},
+    agents: [],
+    pending_interactions: [],
+    seq: 10,
+  };
+}
+
+describe("transcript v2 reducer", () => {
+  it("applies exact-offset deltas and rejects duplicates", () => {
+    const state = transcriptFromPage(page());
+    const operation = {
+      op: "append",
+      target: {
+        type: "frame",
+        turnId: "turn-1",
+        stepId: "step-1",
+        frameId: "answer-1",
+      },
+      offset: 1,
+      text: "案",
+    };
+    const first = applyTranscriptOps(state, [operation], 11);
+    const duplicate = applyTranscriptOps(first.state, [operation], 11);
+    expect(first.gap).toBe(false);
+    expect(duplicate.state).toBe(first.state);
+    expect(
+      (
+        first.state.items[0] as {
+          steps: Array<{ frames: Array<{ text?: string }> }>;
+        }
+      ).steps[0]!.frames[1]!.text,
+    ).toBe("答案");
+  });
+
+  it("signals an offset gap without corrupting visible content", () => {
+    const state = transcriptFromPage(page());
+    const result = applyTranscriptOps(
+      state,
+      [
+        {
+          op: "append",
+          target: {
+            type: "frame",
+            turnId: "turn-1",
+            stepId: "step-1",
+            frameId: "answer-1",
+          },
+          offset: 9,
+          text: "错误拼接",
+        },
+      ],
+      11,
+    );
+    expect(result.gap).toBe(true);
+    expect(result.state).toBe(state);
+  });
+
+  it("signals a sequence gap for REST catch-up", () => {
+    const state = transcriptFromPage(page());
+    expect(applyTranscriptOps(state, [], 13).gap).toBe(true);
+  });
+});

@@ -418,21 +418,46 @@ async fn process_browser_frame(
     };
     let succeeded = result.is_ok();
     let subscription = if result.is_ok()
-        && matches!(operation.as_str(), "sessions.snapshot" | "sessions.events")
+        && matches!(
+            operation.as_str(),
+            "sessions.snapshot"
+                | "sessions.events"
+                | "sessions.transcript.read"
+                | "sessions.transcript.resume"
+        )
         && let Some(session_id) = subscribe_session
     {
-        let sequence = result
-            .as_ref()
-            .ok()
-            .and_then(|value| value.get("asOfSeq"))
-            .and_then(Value::as_u64);
+        let sequence = if matches!(operation.as_str(), "sessions.snapshot" | "sessions.events") {
+            result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("asOfSeq"))
+                .and_then(Value::as_u64)
+        } else {
+            None
+        };
+        let transcript_sequence = if matches!(operation.as_str(), "sessions.transcript.read") {
+            result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("seq"))
+                .and_then(Value::as_u64)
+        } else if matches!(operation.as_str(), "sessions.transcript.resume") {
+            result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("latest_seq"))
+                .and_then(Value::as_u64)
+        } else {
+            None
+        };
         let epoch = result
             .as_ref()
             .ok()
             .and_then(|value| value.get("epoch"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        Some((session_id, sequence, epoch))
+        Some((session_id, sequence, epoch, transcript_sequence))
     } else {
         None
     };
@@ -460,9 +485,9 @@ async fn process_browser_frame(
             }))
             .await?;
     }
-    if let Some((session_id, sequence, epoch)) = subscription {
+    if let Some((session_id, sequence, epoch, transcript_sequence)) = subscription {
         events
-            .subscribe(channel_id, session_id, sequence, epoch)
+            .subscribe(channel_id, session_id, sequence, epoch, transcript_sequence)
             .await?;
     }
     Ok(())

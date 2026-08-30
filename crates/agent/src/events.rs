@@ -45,6 +45,7 @@ enum EventCommand {
 struct Cursor {
     sequence: u64,
     epoch: Option<String>,
+    transcript_sequence: Option<u64>,
 }
 
 pub fn start(
@@ -75,12 +76,25 @@ impl KimiEventController {
         session_id: String,
         sequence: Option<u64>,
         epoch: Option<String>,
+        transcript_sequence: Option<u64>,
     ) -> Result<()> {
         self.commands
             .send(EventCommand::Subscribe {
                 channel_id,
                 session_id,
-                cursor: sequence.map(|sequence| Cursor { sequence, epoch }),
+                cursor: sequence
+                    .map(|sequence| Cursor {
+                        sequence,
+                        epoch: epoch.clone(),
+                        transcript_sequence,
+                    })
+                    .or_else(|| {
+                        transcript_sequence.map(|transcript_sequence| Cursor {
+                            sequence: 0,
+                            epoch,
+                            transcript_sequence: Some(transcript_sequence),
+                        })
+                    }),
             })
             .await
             .context("Kimi event bridge stopped")
@@ -113,11 +127,13 @@ async fn event_loop(
         };
         backoff = Duration::from_secs(1);
         let (mut sink, mut stream) = socket.split();
-        if !subscriptions.is_empty()
-            && sink
-                .send(Message::Text(
-                    subscribe_frame(&subscriptions, &cursors).to_string().into(),
-                ))
+        if sink
+            .send(Message::Text(
+                client_hello_frame(&subscriptions).to_string().into(),
+            ))
+            .await
+            .is_err()
+            || send_subscription_frames(&mut sink, &subscriptions, &cursors)
                 .await
                 .is_err()
         {
@@ -128,11 +144,7 @@ async fn event_loop(
                 command = commands.recv() => {
                     let Some(command) = command else { return };
                     apply_command(command, &mut subscriptions, &mut cursors);
-                    if sink
-                        .send(Message::Text(subscribe_frame(&subscriptions, &cursors).to_string().into()))
-                        .await
-                        .is_err()
-                    {
+                    if send_subscription_frames(&mut sink, &subscriptions, &cursors).await.is_err() {
                         break;
                     }
                 }
@@ -185,8 +197,18 @@ async fn event_loop(
                                 Cursor {
                                     sequence,
                                     epoch: value.get("epoch").and_then(Value::as_str).map(str::to_owned),
+                                    transcript_sequence: cursors.get(session_id).and_then(|cursor| cursor.transcript_sequence),
                                 },
                             );
+                        }
+                        if matches!(value.get("type").and_then(Value::as_str), Some("transcript.ops" | "transcript.reset"))
+                            && let Some(sequence) = value.pointer("/payload/seq").and_then(Value::as_u64)
+                        {
+                            cursors.entry(session_id.to_owned()).or_insert(Cursor {
+                                sequence: 0,
+                                epoch: None,
+                                transcript_sequence: None,
+                            }).transcript_sequence = Some(sequence);
                         }
                         if let Some(channels) = subscriptions.get(session_id) {
                             for channel_id in channels {
@@ -265,6 +287,56 @@ fn subscribe_frame(
     })
 }
 
+fn client_hello_frame(subscriptions: &HashMap<String, HashSet<String>>) -> Value {
+    json!({
+        "type": "client_hello",
+        "id": Uuid::new_v4(),
+        "payload": {
+            "client_id": "aialra-kimi-agent",
+            "subscriptions": subscriptions.keys().cloned().collect::<Vec<_>>()
+        }
+    })
+}
+
+fn transcript_subscribe_frame(session_id: &str, cursor: Option<&Cursor>) -> Value {
+    let since = cursor
+        .and_then(|cursor| cursor.transcript_sequence)
+        .map(|sequence| json!({ "main": sequence }));
+    json!({
+        "type": "subscribe_v2",
+        "id": Uuid::new_v4(),
+        "payload": {
+            "session_id": session_id,
+            "transcript": { "*": "delta" },
+            "transcript_since": since
+        }
+    })
+}
+
+async fn send_subscription_frames<S>(
+    sink: &mut S,
+    subscriptions: &HashMap<String, HashSet<String>>,
+    cursors: &HashMap<String, Cursor>,
+) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    sink.send(Message::Text(
+        subscribe_frame(subscriptions, cursors).to_string().into(),
+    ))
+    .await?;
+    for session_id in subscriptions.keys() {
+        sink.send(Message::Text(
+            transcript_subscribe_frame(session_id, cursors.get(session_id))
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
 fn apply_command(
     command: EventCommand,
     subscriptions: &mut HashMap<String, HashSet<String>>,
@@ -341,6 +413,7 @@ mod tests {
                 cursor: Some(Cursor {
                     sequence: 42,
                     epoch: Some("epoch-one".to_owned()),
+                    transcript_sequence: Some(7),
                 }),
             },
             &mut subscriptions,
@@ -351,6 +424,11 @@ mod tests {
         assert_eq!(
             frame.pointer("/payload/cursors/session-one/seq"),
             Some(&json!(42))
+        );
+        assert_eq!(
+            transcript_subscribe_frame("session-one", cursors.get("session-one"))
+                .pointer("/payload/transcript_since/main"),
+            Some(&json!(7))
         );
         assert_eq!(
             frame.pointer("/payload/cursors/session-one/epoch"),

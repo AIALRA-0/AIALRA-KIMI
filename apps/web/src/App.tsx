@@ -11,6 +11,7 @@ import {
   MessageSquare,
   Moon,
   PanelRightClose,
+  Paperclip,
   Plus,
   Search,
   Send,
@@ -33,6 +34,11 @@ import type {
 import { ActivityPanel } from "./ActivityPanel.js";
 import { ApiError, api } from "./api.js";
 import {
+  CommandMenu,
+  filterCommands,
+  type CommandDescriptor,
+} from "./CommandMenu.js";
+import {
   demoHosts,
   demoMessages,
   demoSessions,
@@ -40,6 +46,12 @@ import {
   type UiSession,
 } from "./demo.js";
 import { InteractionCards } from "./InteractionCards.js";
+import {
+  FileMentionMenu,
+  insertFileMention,
+  matchingFiles,
+  mentionQuery,
+} from "./FileMentionMenu.js";
 import {
   allowedKimiVerificationUrl,
   KimiOAuthPanel,
@@ -51,6 +63,16 @@ import { NewSessionDialog, type NewSessionInput } from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
 import { BrowserRelay, type RelayChannel } from "./relay.js";
 import { TerminalPanel } from "./TerminalPanel.js";
+import { TranscriptTimeline } from "./TranscriptTimeline.js";
+import {
+  applyTranscriptOps,
+  emptyTranscript,
+  prependTranscriptPage,
+  transcriptFromPage,
+  type TranscriptOperation,
+  type TranscriptPage,
+  type TranscriptState,
+} from "./transcript-model.js";
 import {
   appendAssistantDelta,
   coalesceToolMessages,
@@ -69,6 +91,20 @@ import {
 
 type MainView = "conversation" | "terminal" | "account" | "settings";
 
+interface PendingAttachment {
+  id: string;
+  file: File;
+  status: "ready" | "uploading" | "failed";
+  error?: string;
+}
+
+interface ModelDescriptor {
+  model: string;
+  display_name: string;
+  support_efforts?: string;
+  default_effort?: string;
+}
+
 const relay = new BrowserRelay();
 const kimiScopes = [
   "sessions.list",
@@ -80,6 +116,26 @@ const kimiScopes = [
   "sessions.interrupt",
   "sessions.snapshot",
   "sessions.events",
+  "sessions.transcript.read",
+  "sessions.transcript.resume",
+  "sessions.messages.page",
+  "sessions.prompts.list",
+  "sessions.prompts.steer",
+  "sessions.prompts.abort",
+  "sessions.skills.list",
+  "sessions.skills.activate",
+  "sessions.commands.list",
+  "sessions.commands.execute",
+  "sessions.attachments.upload",
+  "sessions.media.read",
+  "sessions.models.list",
+  "sessions.compact",
+  "sessions.undo",
+  "sessions.btw",
+  "sessions.title.write",
+  "sessions.tasks.cancel",
+  "sessions.tasks.detach",
+  "sessions.export",
   "sessions.approvals.respond",
   "sessions.questions.respond",
   "sessions.questions.dismiss",
@@ -156,6 +212,10 @@ function preferredHostId(hosts: HostDescriptor[], current: string): string {
   );
 }
 
+function matchesPermission(value: string): value is PermissionMode {
+  return value === "manual" || value === "auto" || value === "yolo";
+}
+
 export default function App() {
   const demo =
     import.meta.env.VITE_DEMO_MODE === "1" ||
@@ -172,6 +232,9 @@ export default function App() {
   const [messages, setMessages] = useState<UiMessage[]>(
     demo ? demoMessages : [],
   );
+  const [transcript, setTranscript] = useState<TranscriptState | null>(null);
+  const [transcriptSessionId, setTranscriptSessionId] = useState("");
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const conversationMessages = useMemo(
     () => coalesceToolMessages(messages),
     [messages],
@@ -214,6 +277,15 @@ export default function App() {
   const [status, setStatus] = useState(demo ? "合成预览" : "正在连接");
   const [query, setQuery] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [sending, setSending] = useState(false);
+  const [modelOptions, setModelOptions] = useState<ModelDescriptor[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [thinkingLevel, setThinkingLevel] = useState("");
+  const [planMode, setPlanMode] = useState(false);
+  const [commands, setCommands] = useState<CommandDescriptor[]>([]);
+  const [commandSelection, setCommandSelection] = useState(0);
+  const [fileSelection, setFileSelection] = useState(0);
   const [mobileNav, setMobileNav] = useState(false);
   const [rightPanel, setRightPanel] = useState(true);
   const [elevated, setElevated] = useState(false);
@@ -230,12 +302,16 @@ export default function App() {
   const [reconnectGeneration, setReconnectGeneration] = useState(0);
   const [terminalGeneration, setTerminalGeneration] = useState(0);
   const composer = useRef<HTMLTextAreaElement>(null);
+  const attachmentInput = useRef<HTMLInputElement>(null);
   const channelRef = useRef<RelayChannel | null>(null);
   const activeSessionRef = useRef(sessionId);
   const cursorRef = useRef(new Map<string, number>());
   const refreshTimer = useRef<number | null>(null);
   const oauthTimer = useRef<number | null>(null);
   const oauthHostRef = useRef<string | null>(null);
+  const connectedHostRef = useRef<string | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const browserReconnectTimer = useRef<number | null>(null);
 
   const host =
     hosts.find((candidate) => candidate.hostId === hostId) ?? hosts[0];
@@ -250,6 +326,15 @@ export default function App() {
           .includes(query.toLowerCase()),
       ),
     [query, sessions],
+  );
+  const promptQueue = useMemo(
+    () =>
+      transcript
+        ? [...transcript.prompts.values()].filter((item) =>
+            ["running", "queued", "blocked"].includes(String(item.status)),
+          )
+        : [],
+    [transcript],
   );
 
   useEffect(() => {
@@ -337,21 +422,28 @@ export default function App() {
     if (demo || !host) return;
     let disposed = false;
     let opened: RelayChannel | null = null;
+    const changingHost = connectedHostRef.current !== host.hostId;
+    connectedHostRef.current = host.hostId;
     channelRef.current?.close();
     channelRef.current = null;
     setChannel(null);
-    setSessions([]);
-    setSessionId("");
-    setMessages([]);
-    setTasks([]);
-    setApprovals([]);
-    setQuestions([]);
-    setFiles([]);
-    setFileChanges({});
-    setFilePreview(null);
-    setUsage(null);
-    setOauthFlow(null);
-    setError(null);
+    if (changingHost) {
+      setSessions([]);
+      setSessionId("");
+      setMessages([]);
+      setTranscript(null);
+      setTranscriptSessionId("");
+      setTasks([]);
+      setApprovals([]);
+      setQuestions([]);
+      setFiles([]);
+      setFileChanges({});
+      setFilePreview(null);
+      setUsage(null);
+      setOauthFlow(null);
+      setError(null);
+      reconnectAttemptRef.current = 0;
+    }
     oauthHostRef.current = null;
     if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
     void (async () => {
@@ -393,6 +485,7 @@ export default function App() {
           );
           setUsage(usageResult);
           setStatus("在线 · 端到端加密");
+          reconnectAttemptRef.current = 0;
         }
       } catch (nextError) {
         if (!disposed) {
@@ -400,10 +493,7 @@ export default function App() {
             nextError instanceof Error ? nextError.message : "主机通道连接失败",
           );
           setStatus("状态异常 · 正在重连");
-          window.setTimeout(
-            () => setReconnectGeneration((value) => value + 1),
-            1_500,
-          );
+          scheduleBrowserReconnect();
         }
       }
     })();
@@ -420,6 +510,53 @@ export default function App() {
     if (demo || !channel || !sessionId) return;
     void refreshSession(sessionId, channel);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel, demo, sessionId]);
+
+  useEffect(() => {
+    if (demo || !channel || !sessionId) return;
+    let active = true;
+    void Promise.all([
+      channel.rpc<{
+        builtins: CommandDescriptor[];
+        skills: Array<Record<string, unknown>>;
+      }>("sessions.commands.list", { sessionId }),
+      channel
+        .rpc<{
+          items: ModelDescriptor[];
+        }>("sessions.models.list", { sessionId })
+        .catch(() => ({ items: [] })),
+    ])
+      .then(([result, models]) => {
+        if (!active) return;
+        const skills = (result.skills ?? []).flatMap((skill) => {
+          const name =
+            typeof skill.name === "string"
+              ? skill.name
+              : typeof skill.skill_name === "string"
+                ? skill.skill_name
+                : null;
+          if (!name) return [];
+          return [
+            {
+              name,
+              skillName: name,
+              kind: "skill" as const,
+              description:
+                typeof skill.description === "string"
+                  ? skill.description
+                  : "激活目标主机技能",
+              busy: true,
+              argumentHint: "参数",
+            },
+          ];
+        });
+        setCommands([...(result.builtins ?? []), ...skills]);
+        setModelOptions(models.items ?? []);
+      })
+      .catch(() => setCommands([]));
+    return () => {
+      active = false;
+    };
   }, [channel, demo, sessionId]);
 
   useEffect(() => {
@@ -496,6 +633,8 @@ export default function App() {
       if (refreshTimer.current !== null)
         window.clearTimeout(refreshTimer.current);
       if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
+      if (browserReconnectTimer.current !== null)
+        window.clearTimeout(browserReconnectTimer.current);
     },
     [],
   );
@@ -505,13 +644,56 @@ export default function App() {
     if (!event) return;
     if (event.type === "channel.disconnected") {
       setStatus("正在重连");
-      window.setTimeout(
-        () => setReconnectGeneration((value) => value + 1),
-        1_500,
-      );
+      scheduleBrowserReconnect();
       return;
     }
     const selected = activeSessionRef.current;
+    if (event.type === "transcript.reset") {
+      const snapshot = event.payload.snapshot as
+        | Record<string, unknown>
+        | undefined;
+      if (!snapshot || event.sessionId !== selected) return;
+      const page: TranscriptPage = {
+        agent_id: String(event.payload.agent_id ?? "main"),
+        items: (snapshot.items as TranscriptPage["items"]) ?? [],
+        has_more: Boolean(event.payload.has_more_older),
+        tasks: (snapshot.tasks as TranscriptPage["tasks"]) ?? [],
+        interactions: (snapshot.interactions as unknown[]) ?? [],
+        attachments:
+          (snapshot.attachments as TranscriptPage["attachments"]) ?? [],
+        todos: (snapshot.todos as TranscriptPage["todos"]) ?? [],
+        prompts: (snapshot.prompts as TranscriptPage["prompts"]) ?? [],
+        meta: (snapshot.meta as Record<string, unknown>) ?? {},
+        agents: [],
+        pending_interactions: [],
+        ...(typeof event.payload.seq === "number"
+          ? { seq: event.payload.seq }
+          : {}),
+      };
+      setTranscript(transcriptFromPage(page));
+      setTranscriptSessionId(selected);
+      return;
+    }
+    if (event.type === "transcript.ops") {
+      if (event.sessionId !== selected) return;
+      const operations = Array.isArray(event.payload.ops)
+        ? (event.payload.ops as TranscriptOperation[])
+        : [];
+      const sequence =
+        typeof event.payload.seq === "number" ? event.payload.seq : undefined;
+      setTranscript((current) => {
+        const base =
+          current && transcriptSessionId === selected
+            ? current
+            : emptyTranscript(String(event.payload.agent_id ?? "main"));
+        const result = applyTranscriptOps(base, operations, sequence);
+        if (result.gap)
+          window.setTimeout(() => void reconcileTranscript(selected), 0);
+        return result.state;
+      });
+      setTranscriptSessionId(selected);
+      return;
+    }
     if (event.type === "resync_required") {
       const target =
         typeof event.payload.session_id === "string"
@@ -689,6 +871,20 @@ export default function App() {
     );
   }
 
+  function scheduleBrowserReconnect() {
+    if (browserReconnectTimer.current !== null) return;
+    reconnectAttemptRef.current += 1;
+    const ceiling = Math.min(
+      500 * 2 ** Math.max(0, reconnectAttemptRef.current - 1),
+      15_000,
+    );
+    const delay = Math.round(ceiling * (0.65 + Math.random() * 0.35));
+    browserReconnectTimer.current = window.setTimeout(() => {
+      browserReconnectTimer.current = null;
+      setReconnectGeneration((value) => value + 1);
+    }, delay);
+  }
+
   function scheduleSessionListRefresh() {
     const activeChannel = channelRef.current;
     if (!activeChannel) return;
@@ -704,31 +900,48 @@ export default function App() {
   ) {
     if (!activeChannel || !targetSessionId) return;
     try {
-      const [snapshot, fileResult, gitResult] = await Promise.all([
-        activeChannel.rpc<UiSessionSnapshot>("sessions.snapshot", {
-          sessionId: targetSessionId,
-        }),
-        activeChannel
-          .rpc<{
-            items: UiFileEntry[];
-          }>("sessions.files.search", { sessionId: targetSessionId, query: "" })
-          .catch(() => ({ items: [] })),
-        activeChannel
-          .rpc<{
-            entries: Record<string, string>;
-          }>("sessions.files.status", { sessionId: targetSessionId })
-          .catch(() => ({ entries: {} })),
-      ]);
+      const [snapshot, transcriptResult, fileResult, gitResult] =
+        await Promise.all([
+          activeChannel.rpc<UiSessionSnapshot>("sessions.snapshot", {
+            sessionId: targetSessionId,
+          }),
+          activeChannel
+            .rpc<TranscriptPage>("sessions.transcript.read", {
+              sessionId: targetSessionId,
+              agentId: "main",
+              pageSize: 20,
+            })
+            .catch(() => null),
+          activeChannel
+            .rpc<{
+              items: UiFileEntry[];
+            }>("sessions.files.search", {
+              sessionId: targetSessionId,
+              query: "",
+            })
+            .catch(() => ({ items: [] })),
+          activeChannel
+            .rpc<{
+              entries: Record<string, string>;
+            }>("sessions.files.status", { sessionId: targetSessionId })
+            .catch(() => ({ entries: {} })),
+        ]);
       if (activeSessionRef.current !== targetSessionId) return;
       cursorRef.current.set(targetSessionId, snapshot.asOfSeq);
       setLastSequence(snapshot.asOfSeq);
       setMessages(
         withInFlightMessage(snapshot.messages, snapshot.inFlightTurn),
       );
+      if (transcriptResult) {
+        setTranscript(transcriptFromPage(transcriptResult));
+        setTranscriptSessionId(targetSessionId);
+      }
       setApprovals(snapshot.pendingApprovals ?? []);
       setQuestions(snapshot.pendingQuestions ?? []);
       setTasks(snapshot.tasks ?? []);
       setSessionStatus(snapshot.status);
+      setSelectedModel(snapshot.status.model ?? "");
+      setThinkingLevel(snapshot.status.thinkingLevel ?? "");
       setFiles(fileResult.items ?? []);
       setFileChanges(gitResult.entries ?? {});
       setSessions((current) =>
@@ -751,6 +964,84 @@ export default function App() {
       setError(
         nextError instanceof Error ? nextError.message : "读取会话快照失败",
       );
+    }
+  }
+
+  async function reconcileTranscript(targetSessionId: string) {
+    const activeChannel = channelRef.current;
+    if (!activeChannel || !targetSessionId) return;
+    const current = transcriptSessionId === targetSessionId ? transcript : null;
+    if (current?.seq) {
+      try {
+        const catchup = await activeChannel.rpc<{
+          batches: Array<{ seq: number; ops: TranscriptOperation[] }>;
+          latest_seq: number;
+          complete: boolean;
+        }>("sessions.transcript.resume", {
+          sessionId: targetSessionId,
+          agentId: "main",
+          sinceSeq: current.seq,
+        });
+        if (catchup.complete) {
+          let next = current;
+          for (const batch of catchup.batches ?? []) {
+            const applied = applyTranscriptOps(next, batch.ops, batch.seq);
+            if (applied.gap) throw new Error("transcript gap");
+            next = applied.state;
+          }
+          if (activeSessionRef.current === targetSessionId) setTranscript(next);
+          return;
+        }
+      } catch {
+        // A complete page below is the authoritative recovery path
+      }
+    }
+    try {
+      const page = await activeChannel.rpc<TranscriptPage>(
+        "sessions.transcript.read",
+        {
+          sessionId: targetSessionId,
+          agentId: "main",
+          pageSize: 20,
+        },
+      );
+      if (activeSessionRef.current === targetSessionId) {
+        setTranscript(transcriptFromPage(page));
+        setTranscriptSessionId(targetSessionId);
+      }
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error ? nextError.message : "恢复对话记录失败",
+      );
+    }
+  }
+
+  async function loadOlderTurns() {
+    if (!channel || !session || !transcript || loadingOlder) return;
+    const oldest = transcript.items.find((item) => item.kind === "turn");
+    if (!oldest || oldest.kind !== "turn") return;
+    setLoadingOlder(true);
+    try {
+      const page = await channel.rpc<TranscriptPage>(
+        "sessions.transcript.read",
+        {
+          sessionId: session.upstreamSessionId,
+          agentId: transcript.agentId,
+          pageSize: 20,
+          beforeTurn: oldest.turnId,
+        },
+      );
+      setTranscript((current) =>
+        current
+          ? prependTranscriptPage(current, page)
+          : transcriptFromPage(page),
+      );
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error ? nextError.message : "加载更早记录失败",
+      );
+    } finally {
+      setLoadingOlder(false);
     }
   }
 
@@ -794,16 +1085,37 @@ export default function App() {
 
   async function sendPrompt() {
     const text = prompt.trim();
-    if (!text || !session || host?.state !== "online") return;
+    if (
+      (!text && attachments.length === 0) ||
+      !session ||
+      host?.state !== "online" ||
+      sending
+    )
+      return;
+    if (text.startsWith("/")) {
+      const [head] = text.slice(1).split(/\s/u);
+      const command = commands.find(
+        (candidate) =>
+          candidate.name === head || candidate.aliases?.includes(head ?? ""),
+      );
+      if (command) {
+        await executeSlashCommand(
+          command,
+          text.slice((head?.length ?? 0) + 1).trim(),
+        );
+        return;
+      }
+    }
     const message: UiMessage = {
       id: crypto.randomUUID(),
       role: "user",
-      text,
+      text: text || `已添加 ${attachments.length} 个附件`,
       time: new Date().toISOString(),
     };
-    setMessages((current) => [...current, message]);
-    setPrompt("");
     if (demo) {
+      setMessages((current) => [...current, message]);
+      setPrompt("");
+      setAttachments([]);
       window.setTimeout(
         () =>
           setMessages((current) => [
@@ -820,20 +1132,248 @@ export default function App() {
       );
       return;
     }
+    setSending(true);
     try {
+      const content: Array<Record<string, unknown>> = [];
+      if (text) content.push({ type: "text", text });
+      for (const attachment of attachments) {
+        setAttachments((current) =>
+          current.map((item) =>
+            item.id === attachment.id
+              ? { id: item.id, file: item.file, status: "uploading" }
+              : item,
+          ),
+        );
+        const uploaded = await uploadAttachment(attachment.file);
+        if (attachment.file.type.startsWith("image/")) {
+          content.push({
+            type: "image",
+            source: { kind: "file", file_id: uploaded.id },
+          });
+        } else if (attachment.file.type.startsWith("video/")) {
+          content.push({
+            type: "video",
+            source: { kind: "file", file_id: uploaded.id },
+          });
+        } else {
+          content.push({
+            type: "file",
+            file_id: uploaded.id,
+            name: uploaded.name,
+            media_type: uploaded.media_type,
+            size: uploaded.size,
+          });
+        }
+      }
+      setMessages((current) => [...current, message]);
+      setPrompt("");
       await channel?.rpc("sessions.prompt", {
         sessionId: session.upstreamSessionId,
-        content: [{ type: "text", text }],
+        promptId: message.id,
+        content,
         permissionMode: session.permissionMode,
+        ...(selectedModel ? { model: selectedModel } : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+        planMode,
       });
+      setAttachments([]);
     } catch (nextError) {
       setMessages((current) =>
         current.filter((item) => item.id !== message.id),
       );
       setPrompt(text);
+      setAttachments((current) =>
+        current.map((item) => ({
+          ...item,
+          status: "failed",
+          error: nextError instanceof Error ? nextError.message : "上传失败",
+        })),
+      );
       setError(
         nextError instanceof Error ? nextError.message : "发送提示词失败",
       );
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function addAttachments(files: FileList | File[]) {
+    const incoming = Array.from(files);
+    setAttachments((current) => {
+      const available = Math.max(0, 4 - current.length);
+      const accepted = incoming.slice(0, available).flatMap((file) => {
+        if (file.size > 5 * 1024 * 1024) {
+          setError(`${file.name} 超过 5 MiB 限制`);
+          return [];
+        }
+        return [{ id: crypto.randomUUID(), file, status: "ready" as const }];
+      });
+      if (incoming.length > available) setError("每条消息最多添加 4 个附件");
+      return [...current, ...accepted];
+    });
+  }
+
+  async function uploadAttachment(file: File): Promise<{
+    id: string;
+    name: string;
+    media_type: string;
+    size: number;
+  }> {
+    if (!channel) throw new Error("主机通道不可用");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = "";
+    const chunk = 32_768;
+    for (let offset = 0; offset < bytes.length; offset += chunk)
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+    return channel.rpc("sessions.attachments.upload", {
+      name: file.name,
+      mediaType: file.type || "application/octet-stream",
+      content: btoa(binary),
+    });
+  }
+
+  async function controlPrompt(promptId: string, action: "steer" | "abort") {
+    if (!channel || !session) return;
+    try {
+      await channel.rpc(
+        `sessions.prompts.${action}` as "sessions.prompts.steer",
+        {
+          sessionId: session.upstreamSessionId,
+          promptId,
+        },
+      );
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error ? nextError.message : "消息队列操作失败",
+      );
+    }
+  }
+
+  function chooseCommand(command: CommandDescriptor) {
+    const suffix = command.argumentHint ? " " : "";
+    setPrompt(`/${command.name}${suffix}`);
+    setCommandSelection(0);
+    window.requestAnimationFrame(() => composer.current?.focus());
+  }
+
+  function chooseFileMention(file: UiFileEntry) {
+    setPrompt((current) => insertFileMention(current, file.path));
+    setFileSelection(0);
+    window.requestAnimationFrame(() => composer.current?.focus());
+  }
+
+  async function executeSlashCommand(
+    command: CommandDescriptor,
+    argument: string,
+  ) {
+    if (!session || !channel) return;
+    if (sessionStatus?.busy && command.busy === false) {
+      setError(`/${command.name} 需要等待当前任务结束`);
+      return;
+    }
+    if (command.kind === "unavailable") {
+      setError(command.description);
+      return;
+    }
+    if (command.kind === "skill") {
+      try {
+        await channel.rpc("sessions.skills.activate", {
+          sessionId: session.upstreamSessionId,
+          skillName: command.skillName ?? command.name,
+          args: argument || undefined,
+        });
+        setPrompt("");
+      } catch (nextError) {
+        setError(
+          nextError instanceof Error ? nextError.message : "技能激活失败",
+        );
+      }
+      return;
+    }
+    if (command.kind === "agent") {
+      if (command.name === "title" && !argument) {
+        setError("请输入新标题，例如 /title 新标题");
+        return;
+      }
+      try {
+        await channel.rpc("sessions.commands.execute", {
+          sessionId: session.upstreamSessionId,
+          name: command.name,
+          ...(command.name === "title" ? { title: argument } : {}),
+        });
+        setPrompt("");
+        scheduleRefresh();
+        scheduleSessionListRefresh();
+      } catch (nextError) {
+        setError(
+          nextError instanceof Error ? nextError.message : "命令执行失败",
+        );
+      }
+      return;
+    }
+    setPrompt("");
+    switch (command.name) {
+      case "help":
+        setPrompt("/");
+        break;
+      case "sessions":
+        setMobileNav(true);
+        break;
+      case "tasks":
+        setRightPanel(true);
+        break;
+      case "usage":
+      case "login":
+        setView("account");
+        break;
+      case "status":
+        setError(
+          `${host?.displayName ?? "主机"} · ${status} · ${sessionStatus?.busy ? "运行中" : "空闲"}`,
+        );
+        break;
+      case "copy": {
+        const last = [...conversationMessages]
+          .reverse()
+          .find((message) => message.role === "assistant");
+        const transcriptLast = transcript
+          ? [...transcript.items].reverse().find((item) => item.kind === "turn")
+          : null;
+        const text =
+          transcriptLast?.kind === "turn"
+            ? transcriptLast.steps
+                .flatMap((step) => step.frames)
+                .filter(
+                  (frame) =>
+                    frame.kind === "text" && frame.role === "assistant",
+                )
+                .map((frame) => (frame.kind === "text" ? frame.text : ""))
+                .join("")
+            : last?.text;
+        if (text) await navigator.clipboard.writeText(text);
+        break;
+      }
+      case "theme":
+        setTheme(theme === "dark" ? "light" : "dark");
+        break;
+      case "new":
+        setNewSessionOpen(true);
+        break;
+      case "fork":
+        await forkSession();
+        break;
+      case "permission":
+        if (!matchesPermission(argument))
+          setError("权限模式只能是 manual、auto 或 yolo");
+        else await setPermission(argument);
+        break;
+      case "web":
+        setError("当前已经位于 Web 控制台");
+        break;
+      case "mcp":
+      case "plugins":
+        setRightPanel(true);
+        setError(`/${command.name} 状态面板正在读取目标主机能力`);
+        break;
     }
   }
 
@@ -1413,47 +1953,58 @@ export default function App() {
                   <Clock3 size={14} />
                   <span>会话记录</span>
                 </div>
-                {conversationMessages.map((message) => (
-                  <article
-                    key={message.id}
-                    className={`message ${message.role} ${message.isError ? "error" : ""}`}
-                  >
-                    <div className="message-avatar">
-                      {message.role === "assistant" ? (
-                        <Sparkles size={17} />
-                      ) : message.role === "tool" ? (
-                        <Command size={16} />
-                      ) : (
-                        "AO"
-                      )}
-                    </div>
-                    <div className="message-content">
-                      <div className="message-meta">
-                        <strong>
-                          {message.role === "assistant"
-                            ? "Kimi"
-                            : message.role === "tool"
-                              ? (message.toolName ?? "工具")
-                              : "你"}
-                        </strong>
-                        <span>{messageTime(message.time)}</span>
-                        {message.streaming && <em>处理中</em>}
+                {transcript &&
+                transcriptSessionId === session?.upstreamSessionId ? (
+                  <TranscriptTimeline
+                    transcript={transcript}
+                    hostId={host?.hostId ?? ""}
+                    sessionId={session?.upstreamSessionId ?? ""}
+                    onLoadOlder={() => void loadOlderTurns()}
+                    loadingOlder={loadingOlder}
+                  />
+                ) : (
+                  conversationMessages.map((message) => (
+                    <article
+                      key={message.id}
+                      className={`message ${message.role} ${message.isError ? "error" : ""}`}
+                    >
+                      <div className="message-avatar">
+                        {message.role === "assistant" ? (
+                          <Sparkles size={17} />
+                        ) : message.role === "tool" ? (
+                          <Command size={16} />
+                        ) : (
+                          "AO"
+                        )}
                       </div>
-                      {message.role === "tool" ? (
-                        <ToolMessage message={message} />
-                      ) : (
-                        <MarkdownMessage text={message.text} />
-                      )}
-                      {message.streaming && (
-                        <div className="working-line">
-                          <i />
-                          <i />
-                          <i />
+                      <div className="message-content">
+                        <div className="message-meta">
+                          <strong>
+                            {message.role === "assistant"
+                              ? "Kimi"
+                              : message.role === "tool"
+                                ? (message.toolName ?? "工具")
+                                : "你"}
+                          </strong>
+                          <span>{messageTime(message.time)}</span>
+                          {message.streaming && <em>处理中</em>}
                         </div>
-                      )}
-                    </div>
-                  </article>
-                ))}
+                        {message.role === "tool" ? (
+                          <ToolMessage message={message} />
+                        ) : (
+                          <MarkdownMessage text={message.text} />
+                        )}
+                        {message.streaming && (
+                          <div className="working-line">
+                            <i />
+                            <i />
+                            <i />
+                          </div>
+                        )}
+                      </div>
+                    </article>
+                  ))
+                )}
               </div>
             )}
             <InteractionCards
@@ -1465,12 +2016,188 @@ export default function App() {
               onDismissQuestion={dismissQuestion}
             />
             <div className="composer-wrap">
-              <div className="composer">
+              <CommandMenu
+                value={prompt}
+                commands={commands}
+                selected={commandSelection}
+                busy={Boolean(sessionStatus?.busy)}
+                onSelectedChange={setCommandSelection}
+                onChoose={chooseCommand}
+              />
+              <FileMentionMenu
+                value={prompt}
+                files={files}
+                selected={fileSelection}
+                onSelectedChange={setFileSelection}
+                onChoose={chooseFileMention}
+              />
+              <div
+                className="composer"
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  addAttachments(event.dataTransfer.files);
+                }}
+              >
+                {promptQueue.length > 0 && (
+                  <div className="prompt-queue">
+                    {promptQueue.map((item) => {
+                      const promptId = String(item.promptId ?? "");
+                      const state = String(item.status ?? "queued");
+                      return (
+                        <div key={promptId}>
+                          <span>
+                            {state === "running" ? "正在执行" : "排队消息"}
+                          </span>
+                          <code>{promptId.slice(0, 8)}</code>
+                          {state === "queued" && (
+                            <button
+                              onClick={() =>
+                                void controlPrompt(promptId, "steer")
+                              }
+                            >
+                              注入当前执行
+                            </button>
+                          )}
+                          <button
+                            onClick={() =>
+                              void controlPrompt(promptId, "abort")
+                            }
+                          >
+                            取消
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {attachments.length > 0 && (
+                  <div className="attachment-strip">
+                    {attachments.map((attachment) => (
+                      <span
+                        key={attachment.id}
+                        className={
+                          attachment.status === "failed" ? "failed" : ""
+                        }
+                        title={attachment.error}
+                      >
+                        <Paperclip size={12} />
+                        <b>{attachment.file.name}</b>
+                        <small>
+                          {attachment.status === "uploading"
+                            ? "上传中"
+                            : attachment.status === "failed"
+                              ? "重试"
+                              : `${Math.max(1, Math.round(attachment.file.size / 1024))} KiB`}
+                        </small>
+                        <button
+                          type="button"
+                          aria-label={`移除 ${attachment.file.name}`}
+                          disabled={sending}
+                          onClick={() =>
+                            setAttachments((current) =>
+                              current.filter(
+                                (item) => item.id !== attachment.id,
+                              ),
+                            )
+                          }
+                        >
+                          <X size={12} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   ref={composer}
                   value={prompt}
-                  onChange={(event) => setPrompt(event.target.value)}
+                  onChange={(event) => {
+                    setPrompt(event.target.value);
+                    setCommandSelection(0);
+                    setFileSelection(0);
+                  }}
+                  onPaste={(event) => {
+                    const files = Array.from(event.clipboardData.files);
+                    if (files.length) addAttachments(files);
+                  }}
                   onKeyDown={(event) => {
+                    if (mentionQuery(prompt) !== null) {
+                      const visible = matchingFiles(files, prompt);
+                      if (event.key === "ArrowDown") {
+                        event.preventDefault();
+                        setFileSelection((value) =>
+                          visible.length ? (value + 1) % visible.length : 0,
+                        );
+                        return;
+                      }
+                      if (event.key === "ArrowUp") {
+                        event.preventDefault();
+                        setFileSelection((value) =>
+                          visible.length
+                            ? (value - 1 + visible.length) % visible.length
+                            : 0,
+                        );
+                        return;
+                      }
+                      if (
+                        (event.key === "Tab" || event.key === "Enter") &&
+                        visible.length
+                      ) {
+                        event.preventDefault();
+                        chooseFileMention(
+                          visible[fileSelection] ?? visible[0]!,
+                        );
+                        return;
+                      }
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        setPrompt((current) =>
+                          current.replace(/(?:^|\s)@[^\s]*$/u, ""),
+                        );
+                        return;
+                      }
+                    }
+                    if (prompt.startsWith("/")) {
+                      const visible = filterCommands(commands, prompt);
+                      if (event.key === "ArrowDown") {
+                        event.preventDefault();
+                        setCommandSelection((value) =>
+                          visible.length ? (value + 1) % visible.length : 0,
+                        );
+                        return;
+                      }
+                      if (event.key === "ArrowUp") {
+                        event.preventDefault();
+                        setCommandSelection((value) =>
+                          visible.length
+                            ? (value - 1 + visible.length) % visible.length
+                            : 0,
+                        );
+                        return;
+                      }
+                      if (event.key === "Tab" && visible.length) {
+                        event.preventDefault();
+                        chooseCommand(visible[commandSelection] ?? visible[0]!);
+                        return;
+                      }
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        setPrompt("");
+                        return;
+                      }
+                      if (
+                        event.key === "Enter" &&
+                        !event.shiftKey &&
+                        visible.length &&
+                        !commands.some(
+                          (command) => `/${command.name}` === prompt.trim(),
+                        )
+                      ) {
+                        event.preventDefault();
+                        chooseCommand(visible[commandSelection] ?? visible[0]!);
+                        return;
+                      }
+                    }
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
                       void sendPrompt();
@@ -1486,7 +2213,85 @@ export default function App() {
                 />
                 <div className="composer-footer">
                   <div>
-                    <button>
+                    <input
+                      ref={attachmentInput}
+                      className="visually-hidden"
+                      type="file"
+                      multiple
+                      accept="image/*,video/*,.txt,.md,.json,.csv,.pdf,.doc,.docx"
+                      onChange={(event) => {
+                        if (event.target.files)
+                          addAttachments(event.target.files);
+                        event.target.value = "";
+                      }}
+                    />
+                    <button
+                      type="button"
+                      title="添加文件、图片或视频"
+                      onClick={() => attachmentInput.current?.click()}
+                    >
+                      <Paperclip size={15} /> 附件
+                    </button>
+                    <select
+                      className="composer-select model-select"
+                      value={selectedModel}
+                      title="本条消息使用的模型"
+                      aria-label="模型"
+                      onChange={(event) => setSelectedModel(event.target.value)}
+                    >
+                      {modelOptions.length === 0 && (
+                        <option value={selectedModel}>
+                          {selectedModel || "默认模型"}
+                        </option>
+                      )}
+                      {modelOptions.map((model) => (
+                        <option key={model.model} value={model.model}>
+                          {model.display_name}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className="composer-select thinking-select"
+                      value={thinkingLevel}
+                      title="思考强度"
+                      aria-label="思考强度"
+                      onChange={(event) => setThinkingLevel(event.target.value)}
+                    >
+                      <option value="">默认思考</option>
+                      {(
+                        modelOptions
+                          .find((model) => model.model === selectedModel)
+                          ?.support_efforts?.split(/\s+/u)
+                          .filter(Boolean) ?? ["low", "high", "max"]
+                      ).map((effort) => (
+                        <option key={effort} value={effort}>
+                          {effort === "low"
+                            ? "低"
+                            : effort === "high"
+                              ? "高"
+                              : effort === "max"
+                                ? "最高"
+                                : effort}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className={planMode ? "active" : ""}
+                      title="Plan mode"
+                      onClick={() => setPlanMode((value) => !value)}
+                    >
+                      Plan {planMode ? "开" : "关"}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setPrompt("/");
+                        setCommandSelection(0);
+                        window.requestAnimationFrame(() =>
+                          composer.current?.focus(),
+                        );
+                      }}
+                    >
                       <Command size={15} /> 命令
                     </button>
                     <span>
@@ -1500,7 +2305,11 @@ export default function App() {
                   <button
                     className="send-button"
                     onClick={() => void sendPrompt()}
-                    disabled={!prompt.trim() || host?.state !== "online"}
+                    disabled={
+                      (!prompt.trim() && attachments.length === 0) ||
+                      host?.state !== "online" ||
+                      sending
+                    }
                     aria-label="发送消息"
                   >
                     <Send size={17} />

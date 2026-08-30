@@ -34,7 +34,9 @@ interface BrowserConnection {
   >;
 }
 
-const MAX_FRAME_BYTES = 1024 * 1024;
+// A 5 MiB attachment expands through JSON base64 and encrypted framing
+// Keep a hard bound so media works without creating an unbounded relay
+const MAX_FRAME_BYTES = 12 * 1024 * 1024;
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const MAX_AGENT_CONNECTIONS = 128;
 const MAX_BROWSER_CONNECTIONS = 16;

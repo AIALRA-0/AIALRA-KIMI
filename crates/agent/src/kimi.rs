@@ -1,6 +1,7 @@
 use std::{path::PathBuf, process::Stdio, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -201,6 +202,26 @@ impl KimiClient {
             "sessions.prompt" => self.prompt(body).await,
             "sessions.interrupt" => self.session_action(&body, "abort").await,
             "sessions.snapshot" => self.snapshot(body).await,
+            "sessions.transcript.read" => self.transcript(body).await,
+            "sessions.transcript.resume" => self.transcript_ops(body).await,
+            "sessions.messages.page" => self.transcript(body).await,
+            "sessions.prompts.list" => self.prompts(body).await,
+            "sessions.prompts.steer" => self.prompt_action(body, "steer").await,
+            "sessions.prompts.abort" => self.prompt_action(body, "abort").await,
+            "sessions.skills.list" => self.skills(body).await,
+            "sessions.skills.activate" => self.activate_skill(body).await,
+            "sessions.commands.list" => self.commands(body).await,
+            "sessions.commands.execute" => self.execute_command(body).await,
+            "sessions.attachments.upload" => self.upload_attachment(body).await,
+            "sessions.media.read" => self.read_media(body).await,
+            "sessions.models.list" => self.data(Method::GET, "/api/v1/models", None).await,
+            "sessions.compact" => self.session_action(&body, "compact").await,
+            "sessions.undo" => self.session_action(&body, "undo").await,
+            "sessions.btw" => self.btw(body).await,
+            "sessions.title.write" => self.write_title(body).await,
+            "sessions.tasks.cancel" => self.task_action(body, "cancel").await,
+            "sessions.tasks.detach" => self.task_action(body, "detach").await,
+            "sessions.export" => self.export_session(body).await,
             "sessions.events" => {
                 required_path_segment(&body, "sessionId")?;
                 Ok(json!({ "subscribed": true }))
@@ -324,13 +345,10 @@ impl KimiClient {
             .and_then(Value::as_array)
             .map(|items| items.iter().flat_map(normalize_message).collect::<Vec<_>>())
             .unwrap_or_default();
-        let mut in_flight = snapshot
+        let in_flight = snapshot
             .get("in_flight_turn")
             .cloned()
             .unwrap_or(Value::Null);
-        if let Some(turn) = in_flight.as_object_mut() {
-            turn.remove("thinking_text");
-        }
         Ok(json!({
             "messages": messages,
             "permissionMode": status.get("permission").and_then(Value::as_str).unwrap_or("manual"),
@@ -357,19 +375,44 @@ impl KimiClient {
             .get("content")
             .and_then(Value::as_array)
             .filter(|items| !items.is_empty() && items.len() <= 32)
-            .context("prompt content must contain between 1 and 32 text items")?;
+            .context("prompt content must contain between 1 and 32 items")?;
         let mut total_bytes = 0_usize;
         let mut text_content = Vec::with_capacity(content.len());
         for item in content {
-            if item.get("type").and_then(Value::as_str) != Some("text") {
-                bail!("remote prompts currently accept text content only");
+            match item.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    let text = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("prompt text is required")?;
+                    total_bytes = total_bytes.saturating_add(text.len());
+                    text_content.push(json!({ "type": "text", "text": text }));
+                }
+                Some("image" | "video") => {
+                    if item.pointer("/source/kind").and_then(Value::as_str) != Some("file") {
+                        bail!("remote media must reference an uploaded file");
+                    }
+                    validate_path_segment(
+                        item.pointer("/source/file_id")
+                            .and_then(Value::as_str)
+                            .context("media file identity is required")?,
+                        "fileId",
+                    )?;
+                    text_content.push(item.clone());
+                }
+                Some("file") => {
+                    let file_id = item
+                        .get("file_id")
+                        .and_then(Value::as_str)
+                        .context("file identity is required")?;
+                    validate_path_segment(file_id, "fileId")?;
+                    if item.get("path").is_some() {
+                        bail!("remote file prompts cannot reference target-host paths");
+                    }
+                    text_content.push(item.clone());
+                }
+                _ => bail!("remote prompt content type is not allowed"),
             }
-            let text = item
-                .get("text")
-                .and_then(Value::as_str)
-                .context("prompt text is required")?;
-            total_bytes = total_bytes.saturating_add(text.len());
-            text_content.push(json!({ "type": "text", "text": text }));
         }
         if total_bytes > 512 * 1024 {
             bail!("prompt text exceeded the 512 KiB limit");
@@ -381,15 +424,253 @@ impl KimiClient {
         if !matches!(mode, "manual" | "auto" | "yolo") {
             bail!("invalid permission mode");
         }
+        let prompt_id = body
+            .get("promptId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .map(str::to_owned);
+        let mut payload = json!({
+            "content": text_content,
+            "permission_mode": mode
+        });
+        if let Some(prompt_id) = prompt_id {
+            payload["prompt_id"] = json!(prompt_id);
+        }
+        for (source, target) in [("model", "model"), ("thinkingLevel", "thinking")] {
+            if let Some(value) = body.get(source).and_then(Value::as_str) {
+                payload[target] = json!(value);
+            }
+        }
+        if let Some(value) = body.get("planMode").and_then(Value::as_bool) {
+            payload["plan_mode"] = json!(value);
+        }
         self.data(
             Method::POST,
             &format!("/api/v1/sessions/{id}/prompts"),
-            Some(json!({
-                "content": text_content,
-                "permission_mode": mode
-            })),
+            Some(payload),
         )
         .await
+    }
+
+    async fn transcript(&self, body: Value) -> Result<Value> {
+        let id = required_path_segment(&body, "sessionId")?;
+        let agent_id = optional_plain_identifier(&body, "agentId", "main")?;
+        let page_size = body
+            .get("pageSize")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100);
+        let mut path =
+            format!("/api/v1/sessions/{id}/transcript?agent_id={agent_id}&page_size={page_size}");
+        if let Some(before) = body.get("beforeTurn").and_then(Value::as_str) {
+            validate_path_segment(before, "beforeTurn")?;
+            path.push_str("&before_turn=");
+            path.push_str(before);
+        }
+        self.data(Method::GET, &path, None).await
+    }
+
+    async fn transcript_ops(&self, body: Value) -> Result<Value> {
+        let id = required_path_segment(&body, "sessionId")?;
+        let agent_id = optional_plain_identifier(&body, "agentId", "main")?;
+        let since = body.get("sinceSeq").and_then(Value::as_u64).unwrap_or(0);
+        self.data(
+            Method::GET,
+            &format!("/api/v1/sessions/{id}/transcript/ops?agent_id={agent_id}&since_seq={since}"),
+            None,
+        )
+        .await
+    }
+
+    async fn prompts(&self, body: Value) -> Result<Value> {
+        let id = required_path_segment(&body, "sessionId")?;
+        self.data(Method::GET, &format!("/api/v1/sessions/{id}/prompts"), None)
+            .await
+    }
+
+    async fn prompt_action(&self, mut body: Value, action: &str) -> Result<Value> {
+        let id = take_required_path_segment(&mut body, "sessionId")?;
+        let prompt_id = take_required_path_segment(&mut body, "promptId")?;
+        self.data(
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/prompts/{prompt_id}:{action}"),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn skills(&self, body: Value) -> Result<Value> {
+        let id = required_path_segment(&body, "sessionId")?;
+        self.data(Method::GET, &format!("/api/v1/sessions/{id}/skills"), None)
+            .await
+    }
+
+    async fn activate_skill(&self, mut body: Value) -> Result<Value> {
+        let id = take_required_path_segment(&mut body, "sessionId")?;
+        let skill = take_required_path_segment(&mut body, "skillName")?;
+        self.data(
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/skills/{skill}:activate"),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn commands(&self, body: Value) -> Result<Value> {
+        let id = required_path_segment(&body, "sessionId")?.to_owned();
+        let skills = self
+            .skills(body)
+            .await
+            .unwrap_or_else(|_| json!({ "items": [] }));
+        Ok(json!({
+            "sessionId": id,
+            "builtins": builtin_commands(),
+            "skills": skills.get("skills").cloned().unwrap_or_else(|| json!([]))
+        }))
+    }
+
+    async fn execute_command(&self, mut body: Value) -> Result<Value> {
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .context("command name is required")?
+            .trim_start_matches('/')
+            .to_owned();
+        match name.as_str() {
+            "compact" | "undo" => {
+                let id = take_required_path_segment(&mut body, "sessionId")?;
+                self.data(
+                    Method::POST,
+                    &format!("/api/v1/sessions/{id}:{name}"),
+                    Some(json!({})),
+                )
+                .await
+            }
+            "btw" => self.btw(body).await,
+            "title" => self.write_title(body).await,
+            _ => bail!("command is a browser action or is unavailable for remote execution"),
+        }
+    }
+
+    async fn upload_attachment(&self, body: Value) -> Result<Value> {
+        let name = required_string(&body, "name")?;
+        if name.len() > 240 || name.chars().any(char::is_control) {
+            bail!("attachment name is invalid");
+        }
+        let media_type = required_string(&body, "mediaType")?;
+        if media_type.len() > 160 || !media_type.is_ascii() {
+            bail!("attachment media type is invalid");
+        }
+        let encoded = required_string(&body, "content")?;
+        if encoded.len() > 7 * 1024 * 1024 {
+            bail!("attachment exceeded the 5 MiB limit");
+        }
+        let bytes = STANDARD
+            .decode(encoded)
+            .context("attachment content is not valid base64")?;
+        if bytes.len() > 5 * 1024 * 1024 {
+            bail!("attachment exceeded the 5 MiB limit");
+        }
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(name.to_owned())
+            .mime_str(media_type)
+            .context("attachment media type is invalid")?;
+        let response = self
+            .http
+            .post(format!("{}/api/v1/files", self.base_url))
+            .timeout(Duration::from_secs(120))
+            .bearer_auth(&self.token)
+            .header("x-request-id", uuid::Uuid::new_v4().to_string())
+            .multipart(reqwest::multipart::Form::new().part("file", part))
+            .send()
+            .await
+            .context("Kimi attachment upload failed")?;
+        if !response.status().is_success() {
+            bail!("Kimi attachment upload returned HTTP {}", response.status());
+        }
+        let envelope: Value = response
+            .json()
+            .await
+            .context("invalid Kimi upload response")?;
+        let code = envelope.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code != 0 {
+            bail!(
+                "Kimi attachment upload failed with code {code}: {}",
+                envelope
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn read_media(&self, body: Value) -> Result<Value> {
+        let session = required_path_segment(&body, "sessionId")?;
+        let file = required_path_segment(&body, "fileId")?;
+        let bytes = self
+            .raw_bytes(
+                Method::GET,
+                &format!("/api/v1/sessions/{session}/media/{file}"),
+                None,
+                5 * 1024 * 1024,
+            )
+            .await?;
+        Ok(json!({ "encoding": "base64", "content": STANDARD.encode(bytes) }))
+    }
+
+    async fn btw(&self, mut body: Value) -> Result<Value> {
+        let id = take_required_path_segment(&mut body, "sessionId")?;
+        self.data(
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/btw"),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn write_title(&self, mut body: Value) -> Result<Value> {
+        let id = take_required_path_segment(&mut body, "sessionId")?;
+        let title = body
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 240)
+            .context("title must be between 1 and 240 bytes")?;
+        self.data(
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/profile"),
+            Some(json!({ "title": title })),
+        )
+        .await
+    }
+
+    async fn task_action(&self, mut body: Value, action: &str) -> Result<Value> {
+        let id = take_required_path_segment(&mut body, "sessionId")?;
+        let task_id = take_required_path_segment(&mut body, "taskId")?;
+        self.data(
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/tasks/{task_id}:{action}"),
+            Some(json!({})),
+        )
+        .await
+    }
+
+    async fn export_session(&self, body: Value) -> Result<Value> {
+        let id = required_path_segment(&body, "sessionId")?;
+        let archive = self
+            .raw_bytes(
+                Method::POST,
+                &format!("/api/v1/sessions/{id}/export"),
+                Some(json!({ "desktop": false })),
+                24 * 1024 * 1024,
+            )
+            .await?;
+        Ok(json!({
+            "mediaType": "application/zip",
+            "fileName": format!("kimi-session-{id}.zip"),
+            "encoding": "base64",
+            "content": STANDARD.encode(archive)
+        }))
     }
 
     async fn session_action(&self, body: &Value, action: &str) -> Result<Value> {
@@ -656,6 +937,39 @@ impl KimiClient {
         Ok(response.bytes().await?.to_vec())
     }
 
+    async fn raw_bytes(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let mut request = self
+            .http
+            .request(method, format!("{}{}", self.base_url, path))
+            .timeout(Duration::from_secs(120))
+            .bearer_auth(&self.token)
+            .header("x-request-id", uuid::Uuid::new_v4().to_string());
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.context("Kimi server request failed")?;
+        if !response.status().is_success() {
+            bail!("Kimi server returned HTTP {}", response.status());
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > limit as u64)
+        {
+            bail!("Kimi export exceeded the encrypted relay limit");
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() > limit {
+            bail!("Kimi export exceeded the encrypted relay limit");
+        }
+        Ok(bytes.to_vec())
+    }
+
     fn port(&self) -> u16 {
         self.base_url
             .rsplit_once(':')
@@ -703,6 +1017,37 @@ fn validate_path_segment(segment: &str, key: &str) -> Result<()> {
         bail!("{key} contains characters that are unsafe in an upstream path");
     }
     Ok(())
+}
+
+fn optional_plain_identifier<'a>(value: &'a Value, key: &str, default: &'a str) -> Result<&'a str> {
+    let identifier = value.get(key).and_then(Value::as_str).unwrap_or(default);
+    validate_path_segment(identifier, key)?;
+    Ok(identifier)
+}
+
+fn builtin_commands() -> Value {
+    json!([
+        { "name": "help", "kind": "browser", "description": "显示命令帮助", "busy": true },
+        { "name": "sessions", "kind": "browser", "description": "打开会话列表", "busy": true },
+        { "name": "tasks", "kind": "browser", "description": "打开任务面板", "busy": true },
+        { "name": "usage", "kind": "browser", "description": "打开用量页面", "busy": true },
+        { "name": "status", "kind": "browser", "description": "显示主机和会话状态", "busy": true },
+        { "name": "copy", "kind": "browser", "description": "复制最后一条回复", "busy": true },
+        { "name": "theme", "kind": "browser", "description": "切换黑白主题", "busy": true },
+        { "name": "new", "kind": "browser", "description": "新建会话", "busy": true },
+        { "name": "fork", "kind": "browser", "description": "分叉当前会话", "busy": false },
+        { "name": "title", "kind": "agent", "description": "修改会话标题", "busy": true, "argumentHint": "标题" },
+        { "name": "compact", "kind": "agent", "description": "压缩当前上下文", "busy": false },
+        { "name": "undo", "kind": "agent", "description": "撤销上一轮", "busy": false },
+        { "name": "permission", "kind": "browser", "description": "切换权限模式", "busy": true, "argumentHint": "manual | auto | yolo" },
+        { "name": "btw", "kind": "agent", "description": "启动旁路问题", "busy": true },
+        { "name": "login", "kind": "browser", "description": "打开 Kimi 登录", "busy": true },
+        { "name": "mcp", "kind": "browser", "description": "查看 MCP 状态", "busy": true },
+        { "name": "plugins", "kind": "browser", "description": "查看插件状态", "busy": true },
+        { "name": "web", "kind": "browser", "description": "当前已经位于 Web 控制台", "busy": true },
+        { "name": "exit", "kind": "unavailable", "description": "远程 Web 会话不支持退出宿主终端", "busy": true },
+        { "name": "editor", "kind": "unavailable", "description": "远程 Web 不启动目标主机图形应用", "busy": true }
+    ])
 }
 
 fn normalize_session(host_id: &str, value: &Value) -> Value {
