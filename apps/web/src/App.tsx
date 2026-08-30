@@ -34,8 +34,10 @@ import type {
 import { ActivityPanel } from "./ActivityPanel.js";
 import { ApiError, api } from "./api.js";
 import {
+  BUILTIN_COMMANDS,
   CommandMenu,
   filterCommands,
+  mergeCommands,
   type CommandDescriptor,
 } from "./CommandMenu.js";
 import {
@@ -283,7 +285,8 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState("");
   const [thinkingLevel, setThinkingLevel] = useState("");
   const [planMode, setPlanMode] = useState(false);
-  const [commands, setCommands] = useState<CommandDescriptor[]>([]);
+  const [commands, setCommands] =
+    useState<CommandDescriptor[]>(BUILTIN_COMMANDS);
   const [commandSelection, setCommandSelection] = useState(0);
   const [fileSelection, setFileSelection] = useState(0);
   const [mobileNav, setMobileNav] = useState(false);
@@ -469,12 +472,12 @@ export default function App() {
         );
         if (disposed) return opened.close();
         channelRef.current = opened;
-        setChannel(opened);
         const [sessionResult, usageResult] = await Promise.all([
           opened.rpc<{ sessions: UiSession[] }>("sessions.list"),
           opened.rpc<UsageSnapshot>("oauth.usage").catch(() => null),
         ]);
         if (!disposed) {
+          setChannel(opened);
           setSessions(sessionResult.sessions);
           setSessionId((current) =>
             sessionResult.sessions.some(
@@ -484,6 +487,7 @@ export default function App() {
               : (sessionResult.sessions[0]?.upstreamSessionId ?? ""),
           );
           setUsage(usageResult);
+          setError(null);
           setStatus("在线 · 端到端加密");
           reconnectAttemptRef.current = 0;
         }
@@ -550,10 +554,10 @@ export default function App() {
             },
           ];
         });
-        setCommands([...(result.builtins ?? []), ...skills]);
+        setCommands(mergeCommands(result.builtins ?? [], skills));
         setModelOptions(models.items ?? []);
       })
-      .catch(() => setCommands([]));
+      .catch(() => setCommands(BUILTIN_COMMANDS));
     return () => {
       active = false;
     };
@@ -944,6 +948,7 @@ export default function App() {
       setThinkingLevel(snapshot.status.thinkingLevel ?? "");
       setFiles(fileResult.items ?? []);
       setFileChanges(gitResult.entries ?? {});
+      setError(null);
       setSessions((current) =>
         current.map((item) =>
           item.upstreamSessionId === targetSessionId

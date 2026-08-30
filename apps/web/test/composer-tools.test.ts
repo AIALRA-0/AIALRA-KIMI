@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { filterCommands } from "../src/CommandMenu.js";
+import {
+  BUILTIN_COMMANDS,
+  filterCommands,
+  mergeCommands,
+} from "../src/CommandMenu.js";
 import {
   insertFileMention,
   matchingFiles,
@@ -7,6 +11,12 @@ import {
 } from "../src/FileMentionMenu.js";
 
 describe("composer command and file completion", () => {
+  it("keeps the fixed command baseline when dynamic discovery is unavailable", () => {
+    const merged = mergeCommands([], []);
+    expect(merged).toEqual(BUILTIN_COMMANDS);
+    expect(merged.map((command) => command.name)).toContain("compact");
+  });
+
   it("filters official slash commands without treating backslash as a command", () => {
     const commands = [
       { name: "compact", kind: "agent" as const, description: "压缩" },

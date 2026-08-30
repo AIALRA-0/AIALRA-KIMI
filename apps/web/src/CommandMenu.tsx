@@ -11,6 +11,88 @@ export interface CommandDescriptor {
   skillName?: string;
 }
 
+export const BUILTIN_COMMANDS: CommandDescriptor[] = [
+  { name: "help", kind: "browser", description: "显示命令帮助", busy: true },
+  {
+    name: "sessions",
+    kind: "browser",
+    description: "打开会话列表",
+    busy: true,
+  },
+  { name: "tasks", kind: "browser", description: "打开任务面板", busy: true },
+  { name: "usage", kind: "browser", description: "打开用量页面", busy: true },
+  {
+    name: "status",
+    kind: "browser",
+    description: "显示主机和会话状态",
+    busy: true,
+  },
+  {
+    name: "copy",
+    kind: "browser",
+    description: "复制最后一条回复",
+    busy: true,
+  },
+  { name: "theme", kind: "browser", description: "切换黑白主题", busy: true },
+  { name: "new", kind: "browser", description: "新建会话", busy: true },
+  { name: "fork", kind: "browser", description: "分叉当前会话", busy: false },
+  {
+    name: "title",
+    kind: "agent",
+    description: "修改会话标题",
+    busy: true,
+    argumentHint: "标题",
+  },
+  {
+    name: "compact",
+    kind: "agent",
+    description: "压缩当前上下文",
+    busy: false,
+  },
+  { name: "undo", kind: "agent", description: "撤销上一轮", busy: false },
+  {
+    name: "permission",
+    kind: "browser",
+    description: "切换权限模式",
+    busy: true,
+    argumentHint: "manual | auto | yolo",
+  },
+  { name: "btw", kind: "agent", description: "启动旁路问题", busy: true },
+  { name: "login", kind: "browser", description: "打开 Kimi 登录", busy: true },
+  { name: "mcp", kind: "browser", description: "查看 MCP 状态", busy: true },
+  { name: "plugins", kind: "browser", description: "查看插件状态", busy: true },
+  {
+    name: "web",
+    kind: "browser",
+    description: "当前已经位于 Web 控制台",
+    busy: true,
+  },
+  {
+    name: "exit",
+    kind: "unavailable",
+    description: "远程 Web 会话不支持退出宿主终端",
+    busy: true,
+  },
+  {
+    name: "editor",
+    kind: "unavailable",
+    description: "远程 Web 不启动目标主机图形应用",
+    busy: true,
+  },
+];
+
+export function mergeCommands(
+  builtins: CommandDescriptor[],
+  dynamic: CommandDescriptor[],
+): CommandDescriptor[] {
+  const merged = new Map(
+    BUILTIN_COMMANDS.map((command) => [command.name, command]),
+  );
+  for (const command of [...builtins, ...dynamic])
+    merged.set(command.name, command);
+  return [...merged.values()];
+}
+
 export function CommandMenu({
   value,
   commands,
