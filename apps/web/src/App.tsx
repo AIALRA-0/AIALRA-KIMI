@@ -327,6 +327,8 @@ export default function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<UiSession | null>(null);
+  const [renameTitle, setRenameTitle] = useState("");
   const [pairingOpen, setPairingOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [oauthFlow, setOauthFlow] = useState<OAuthFlow | null>(null);
@@ -1635,9 +1637,15 @@ export default function App() {
     }
   }
 
-  async function renameSession(target: UiSession) {
-    if (!channel) return;
-    const title = window.prompt("输入新的对话名称", target.title)?.trim();
+  function beginRename(target: UiSession) {
+    setRenameTarget(target);
+    setRenameTitle(target.title);
+  }
+
+  async function renameSession() {
+    if (!channel || !renameTarget) return;
+    const target = renameTarget;
+    const title = renameTitle.trim();
     if (!title || title === target.title) return;
     setActionBusy(true);
     try {
@@ -1654,6 +1662,8 @@ export default function App() {
       if (!updated || updated.title !== title)
         throw new Error("上游尚未确认新名称，请稍后重试");
       setSessions(verified.sessions);
+      setRenameTarget(null);
+      setRenameTitle("");
     } catch (nextError) {
       setError(
         nextError instanceof Error ? nextError.message : "重命名对话失败",
@@ -2088,7 +2098,7 @@ export default function App() {
                           title="重命名对话"
                           aria-label="重命名对话"
                           disabled={actionBusy}
-                          onClick={() => void renameSession(item)}
+                          onClick={() => beginRename(item)}
                         >
                           <Pencil size={13} />
                         </button>
@@ -2878,6 +2888,76 @@ export default function App() {
           onCreate={createSession}
           onClose={() => setNewSessionOpen(false)}
         />
+      )}
+      {renameTarget && (
+        <div
+          className="dialog-scrim"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !actionBusy) {
+              setRenameTarget(null);
+              setRenameTitle("");
+            }
+          }}
+        >
+          <form
+            className="dialog-card"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void renameSession();
+            }}
+          >
+            <div className="dialog-head">
+              <div>
+                <p className="eyebrow">对话设置</p>
+                <h2>重命名对话</h2>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                disabled={actionBusy}
+                onClick={() => {
+                  setRenameTarget(null);
+                  setRenameTitle("");
+                }}
+                aria-label="关闭重命名窗口"
+              >
+                <X size={17} />
+              </button>
+            </div>
+            <label>
+              对话名称
+              <input
+                autoFocus
+                maxLength={200}
+                value={renameTitle}
+                onChange={(event) => setRenameTitle(event.target.value)}
+              />
+            </label>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                disabled={actionBusy}
+                onClick={() => {
+                  setRenameTarget(null);
+                  setRenameTitle("");
+                }}
+              >
+                取消
+              </button>
+              <button
+                className="primary-button"
+                disabled={
+                  actionBusy ||
+                  !renameTitle.trim() ||
+                  renameTitle.trim() === renameTarget.title
+                }
+              >
+                {actionBusy ? "正在保存…" : "保存名称"}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
       {pairingOpen && <PairingDialog onClose={() => setPairingOpen(false)} />}
     </div>

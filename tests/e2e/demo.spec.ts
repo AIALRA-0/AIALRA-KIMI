@@ -151,3 +151,19 @@ test("distinguishes the normal terminal from optional elevation", async ({
   ).toBeVisible();
   await expect(page.getByText("管理员代理不可用")).toHaveCount(0);
 });
+
+test("opens an in-page rename dialog instead of a browser prompt", async ({
+  page,
+}, testInfo) => {
+  await openMobileNavigation(page, testInfo.project.name);
+  await page.getByRole("button", { name: "重命名对话" }).first().click();
+  await expect(page.getByRole("heading", { name: "重命名对话" })).toBeVisible();
+  const title = page.getByRole("textbox", { name: "对话名称" });
+  await expect(title).not.toHaveValue("");
+  await title.fill("新的对话名称");
+  await expect(page.getByRole("button", { name: "保存名称" })).toBeEnabled();
+  await page.getByRole("button", { name: "取消" }).click();
+  await expect(page.getByRole("heading", { name: "重命名对话" })).toHaveCount(
+    0,
+  );
+});
