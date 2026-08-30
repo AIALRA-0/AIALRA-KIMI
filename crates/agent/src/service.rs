@@ -5,6 +5,8 @@ use anyhow::Result;
 
 #[cfg(windows)]
 const WINDOWS_RUN_VALUE: &str = "AIALRA-KIMI-Agent";
+#[cfg(windows)]
+const WINDOWS_TASK_NAME: &str = "AIALRA-KIMI-Agent";
 
 pub fn install() -> Result<()> {
     install_platform()
@@ -17,7 +19,6 @@ pub fn uninstall() -> Result<()> {
 #[cfg(windows)]
 fn install_platform() -> Result<()> {
     use anyhow::{Context, bail};
-    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
     let executable = std::env::current_exe().context("failed to resolve the agent executable")?;
@@ -29,52 +30,117 @@ fn install_platform() -> Result<()> {
         .context("failed to signal the previous watchdog")?;
     std::thread::sleep(std::time::Duration::from_secs(6));
     let _ = std::fs::remove_file(state_dir.join("watchdog.stop"));
-    let action = watchdog_action(&executable, &state_dir, &kimi_home);
-    let status = Command::new("reg.exe")
+    let _ = Command::new("reg.exe")
         .args([
-            "ADD",
+            "DELETE",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
             "/v",
             WINDOWS_RUN_VALUE,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &action,
             "/f",
         ])
-        .status()
-        .context("failed to create the current-user startup entry")?;
-    if !status.success() {
-        bail!("Windows rejected the current-user agent startup entry");
-    }
-    Command::new(&executable)
+        .status();
+
+    let user = String::from_utf8(
+        Command::new("whoami.exe")
+            .output()
+            .context("failed to resolve the current Windows user")?
+            .stdout,
+    )
+    .context("Windows returned a non-UTF-8 account name")?;
+    let task_xml_path = state_dir.join("agent-task.xml");
+    std::fs::write(
+        &task_xml_path,
+        utf16le_with_bom(&windows_task_xml(
+            &executable,
+            &state_dir,
+            &kimi_home,
+            user.trim(),
+        )),
+    )
+    .context("failed to write the Windows task definition")?;
+    let status = Command::new("schtasks.exe")
         .args([
-            "watchdog",
-            "--state-dir",
-            &state_dir.to_string_lossy(),
-            "--kimi-home",
-            &kimi_home.to_string_lossy(),
+            "/Create",
+            "/TN",
+            WINDOWS_TASK_NAME,
+            "/XML",
+            &task_xml_path.to_string_lossy(),
+            "/F",
         ])
-        .creation_flags(0x0000_0008 | 0x0800_0000)
-        .spawn()
-        .context("failed to start the current-user agent watchdog")?;
-    println!("Installed and started the current-user AIALRA-KIMI watchdog");
-    println!("The watchdog starts at sign-in and restarts the agent after failures");
+        .status()
+        .context("failed to create the current-user watchdog task")?;
+    let _ = std::fs::remove_file(&task_xml_path);
+    if !status.success() {
+        bail!("Windows rejected the current-user watchdog task");
+    }
+    let status = Command::new("schtasks.exe")
+        .args(["/Run", "/TN", WINDOWS_TASK_NAME])
+        .status()
+        .context("failed to start the current-user watchdog task")?;
+    if !status.success() {
+        bail!("Windows rejected the watchdog task start request");
+    }
+    println!("Installed and started the current-user AIALRA-KIMI agent task");
+    println!("Task Scheduler restarts the agent and checks it every five minutes");
     Ok(())
 }
 
 #[cfg(windows)]
-fn watchdog_action(
+fn windows_task_xml(
     executable: &std::path::Path,
     state_dir: &std::path::Path,
     kimi_home: &std::path::Path,
+    user: &str,
 ) -> String {
     format!(
-        "\"{}\" watchdog --state-dir \"{}\" --kimi-home \"{}\"",
-        executable.display(),
-        state_dir.display(),
-        kimi_home.display()
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>AIALRA-KIMI outbound host agent</Description></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger>
+    <CalendarTrigger>
+      <Repetition><Interval>PT1M</Interval><Duration>P1D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+      <StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>true</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{executable}</Command><Arguments>watchdog --state-dir &quot;{state_dir}&quot; --kimi-home &quot;{kimi_home}&quot;</Arguments></Exec></Actions>
+</Task>"#,
+        user = xml_escape(user),
+        executable = xml_escape(&executable.to_string_lossy()),
+        state_dir = xml_escape(&state_dir.to_string_lossy()),
+        kimi_home = xml_escape(&kimi_home.to_string_lossy()),
     )
+}
+
+#[cfg(windows)]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(windows)]
+fn utf16le_with_bom(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + value.len() * 2);
+    bytes.extend_from_slice(&[0xff, 0xfe]);
+    for unit in value.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 
 #[cfg(windows)]
@@ -103,6 +169,7 @@ pub async fn run_watchdog(
             .creation_flags(0x0800_0000)
             .spawn()
             .context("failed to start the host agent")?;
+        let _child_job = assign_child_to_kill_on_close_job(&child)?;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
@@ -119,11 +186,73 @@ pub async fn run_watchdog(
 }
 
 #[cfg(windows)]
+struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for ChildJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn assign_child_to_kill_on_close_job(child: &tokio::process::Child) -> Result<ChildJob> {
+    use anyhow::{Context, bail};
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(std::io::Error::last_os_error()).context("failed to create the agent job");
+    }
+    let job = ChildJob(job);
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to configure the agent job");
+    }
+    let process = child
+        .raw_handle()
+        .context("the child process handle is unavailable")?;
+    if unsafe { AssignProcessToJobObject(job.0, process.cast()) } == 0 {
+        bail!(
+            "failed to assign the host agent to its job: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(job)
+}
+
+#[cfg(windows)]
 fn uninstall_platform() -> Result<()> {
     use anyhow::{Context, bail};
     use std::process::Command;
 
-    let status = Command::new("reg.exe")
+    let _ = Command::new("schtasks.exe")
+        .args(["/End", "/TN", WINDOWS_TASK_NAME])
+        .status();
+    let status = Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
+        .status()
+        .context("failed to remove the current-user watchdog task")?;
+    if !status.success() {
+        bail!("Windows rejected the watchdog task removal");
+    }
+    let _ = Command::new("reg.exe")
         .args([
             "DELETE",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -131,11 +260,7 @@ fn uninstall_platform() -> Result<()> {
             WINDOWS_RUN_VALUE,
             "/f",
         ])
-        .status()
-        .context("failed to remove the current-user startup entry")?;
-    if !status.success() {
-        bail!("Windows rejected the current-user startup entry removal");
-    }
+        .status();
     std::fs::write(crate::config::data_dir()?.join("watchdog.stop"), b"stop")
         .context("failed to stop the current-user watchdog")?;
     println!("Removed the current-user AIALRA-KIMI watchdog");
@@ -225,16 +350,21 @@ fn systemd_quote(path: &Path) -> String {
 mod tests {
     #[cfg(windows)]
     #[test]
-    fn windows_watchdog_action_quotes_all_paths() {
-        let action = super::watchdog_action(
+    fn windows_task_restarts_and_escapes_paths() {
+        let task = super::windows_task_xml(
             std::path::Path::new(r"C:\Program Files\AIALRA & Kimi\agent.exe"),
             std::path::Path::new(r"C:\Users\owner\AppData\Local\AIALRA Kimi"),
             std::path::Path::new(r"C:\Users\owner\.kimi-code"),
+            r"DESKTOP\owner",
         );
-        assert!(action.starts_with('"'));
-        assert!(action.contains("agent.exe\" watchdog"));
-        assert!(action.contains("--state-dir \"C:\\Users\\owner"));
-        assert!(action.contains("--kimi-home \"C:\\Users\\owner\\.kimi-code\""));
+        assert!(task.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(task.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count>"));
+        assert!(task.contains("<Interval>PT1M</Interval>"));
+        assert!(task.contains("AIALRA &amp; Kimi"));
+        assert!(task.contains("watchdog --state-dir &quot;C:\\Users\\owner"));
+        let encoded = super::utf16le_with_bom(&task);
+        assert_eq!(&encoded[..2], &[0xff, 0xfe]);
+        assert!(encoded.windows(4).any(|window| window == b"<\0T\0"));
     }
 
     #[cfg(unix)]

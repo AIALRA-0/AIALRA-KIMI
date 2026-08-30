@@ -82,6 +82,21 @@ test("offers outbound-only VPS and remote host pairing", async ({
   ).toBeVisible();
 });
 
+test("shows usage percentages and styled selects", async ({
+  page,
+}, testInfo) => {
+  await openMobileNavigation(page, testInfo.project.name);
+  await page.getByRole("button", { name: "用量" }).click();
+  await expect(page.getByText("63% 已用")).toBeVisible();
+  await expect(page.getByText("18% 已用")).toBeVisible();
+
+  await openMobileNavigation(page, testInfo.project.name);
+  await page.getByRole("button", { name: "设置" }).click();
+  const select = page.getByRole("combobox", { name: "新会话默认权限" });
+  await expect(select).toHaveCSS("appearance", "none");
+  await expect(select).not.toHaveCSS("background-image", "none");
+});
+
 test("renders Markdown and collapses completed tool calls", async ({
   page,
 }) => {

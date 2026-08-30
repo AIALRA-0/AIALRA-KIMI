@@ -1587,8 +1587,9 @@ export default function App() {
                             <div>
                               <strong>{window.label}</strong>
                               <span>
-                                {window.used}
-                                {window.unit} 已用
+                                {window.unit === "%"
+                                  ? `${Math.round(percent)}% 已用`
+                                  : `${Math.round(percent)}% · ${window.used} ${window.unit} 已用`}
                               </span>
                             </div>
                             <div className="meter-track">
