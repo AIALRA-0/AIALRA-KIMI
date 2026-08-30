@@ -64,7 +64,7 @@ impl KimiRuntime {
             .spawn()
             .with_context(|| format!("failed to start {}", config.kimi_executable))?;
 
-        for _ in 0..40 {
+        for _ in 0..240 {
             if let Some(status) = child.try_wait().context("failed to inspect Kimi process")? {
                 bail!("Kimi server exited during startup with {status}");
             }
@@ -77,6 +77,7 @@ impl KimiRuntime {
             sleep(Duration::from_millis(250)).await;
         }
         let _ = child.kill().await;
+        let _ = child.wait().await;
         bail!("Kimi server did not become ready on the configured loopback port")
     }
 
