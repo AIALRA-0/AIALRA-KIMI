@@ -61,6 +61,7 @@ import {
   type OAuthFlow,
 } from "./KimiOAuthPanel.js";
 import { MarkdownMessage, ToolMessage } from "./MessageBody.js";
+import { supportedEfforts } from "./model-options.js";
 import { NewSessionDialog, type NewSessionInput } from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
 import { BrowserRelay, type RelayChannel } from "./relay.js";
@@ -103,7 +104,7 @@ interface PendingAttachment {
 interface ModelDescriptor {
   model: string;
   display_name: string;
-  support_efforts?: string;
+  support_efforts?: string | string[];
   default_effort?: string;
 }
 
@@ -2263,11 +2264,10 @@ export default function App() {
                       onChange={(event) => setThinkingLevel(event.target.value)}
                     >
                       <option value="">默认思考</option>
-                      {(
-                        modelOptions
-                          .find((model) => model.model === selectedModel)
-                          ?.support_efforts?.split(/\s+/u)
-                          .filter(Boolean) ?? ["low", "high", "max"]
+                      {supportedEfforts(
+                        modelOptions.find(
+                          (model) => model.model === selectedModel,
+                        )?.support_efforts,
                       ).map((effort) => (
                         <option key={effort} value={effort}>
                           {effort === "low"

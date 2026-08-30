@@ -9,6 +9,7 @@ import {
   matchingFiles,
   mentionQuery,
 } from "../src/FileMentionMenu.js";
+import { supportedEfforts } from "../src/model-options.js";
 
 describe("composer command and file completion", () => {
   it("keeps the fixed command baseline when dynamic discovery is unavailable", () => {
@@ -38,5 +39,15 @@ describe("composer command and file completion", () => {
     expect(insertFileMention("请检查 @mai", "src/main.ts")).toBe(
       "请检查 @src/main.ts ",
     );
+  });
+
+  it("accepts both upstream thinking effort shapes", () => {
+    expect(supportedEfforts(["low", "high", "max"])).toEqual([
+      "low",
+      "high",
+      "max",
+    ]);
+    expect(supportedEfforts("low high max")).toEqual(["low", "high", "max"]);
+    expect(supportedEfforts(undefined)).toEqual(["low", "high", "max"]);
   });
 });
