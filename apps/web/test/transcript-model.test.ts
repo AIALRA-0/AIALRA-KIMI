@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyTranscriptReset,
   applyTranscriptOps,
+  mergeTranscriptPage,
   transcriptFromPage,
   type TranscriptPage,
 } from "../src/transcript-model.js";
@@ -116,5 +117,16 @@ describe("transcript v2 reducer", () => {
     expect(applyTranscriptReset(current, { ...staleReset, seq: 13 })).toBe(
       current,
     );
+  });
+
+  it("keeps an empty recovery page scoped to its session", () => {
+    const current = transcriptFromPage(page());
+    const emptyPage = { ...page(), items: [] };
+    expect(
+      mergeTranscriptPage(current, "session-1", "session-1", emptyPage),
+    ).toBe(current);
+    expect(
+      mergeTranscriptPage(current, "session-1", "session-2", emptyPage).items,
+    ).toEqual([]);
   });
 });

@@ -72,6 +72,7 @@ import {
   applyTranscriptReset,
   applyTranscriptOps,
   emptyTranscript,
+  mergeTranscriptPage,
   prependTranscriptPage,
   transcriptFromPage,
   type TranscriptOperation,
@@ -962,7 +963,14 @@ export default function App() {
         withInFlightMessage(snapshot.messages, snapshot.inFlightTurn),
       );
       if (transcriptResult) {
-        setTranscript(transcriptFromPage(transcriptResult));
+        setTranscript((current) =>
+          mergeTranscriptPage(
+            current,
+            transcriptSessionId,
+            targetSessionId,
+            transcriptResult,
+          ),
+        );
         setTranscriptSessionId(targetSessionId);
         clearTranscriptRetry();
       } else {
@@ -1041,7 +1049,14 @@ export default function App() {
         },
       );
       if (activeSessionRef.current === targetSessionId) {
-        setTranscript(transcriptFromPage(page));
+        setTranscript((current) =>
+          mergeTranscriptPage(
+            current,
+            transcriptSessionId,
+            targetSessionId,
+            page,
+          ),
+        );
         setTranscriptSessionId(targetSessionId);
         clearTranscriptRetry();
         setError(null);

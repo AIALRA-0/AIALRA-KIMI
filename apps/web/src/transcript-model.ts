@@ -205,6 +205,17 @@ export function applyTranscriptReset(
   return current;
 }
 
+export function mergeTranscriptPage(
+  current: TranscriptState | null,
+  currentSessionId: string,
+  targetSessionId: string,
+  page: TranscriptPage,
+): TranscriptState {
+  return currentSessionId === targetSessionId
+    ? applyTranscriptReset(current, page)
+    : transcriptFromPage(page);
+}
+
 export function prependTranscriptPage(
   state: TranscriptState,
   page: TranscriptPage,
