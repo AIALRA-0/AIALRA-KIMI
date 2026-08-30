@@ -64,6 +64,7 @@ import { MarkdownMessage, ToolMessage } from "./MessageBody.js";
 import { supportedEfforts } from "./model-options.js";
 import { NewSessionDialog, type NewSessionInput } from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
+import { transcriptRetryDelay } from "./recovery-policy.js";
 import { BrowserRelay, type RelayChannel } from "./relay.js";
 import { TerminalPanel } from "./TerminalPanel.js";
 import { TranscriptTimeline } from "./TranscriptTimeline.js";
@@ -316,6 +317,8 @@ export default function App() {
   const connectedHostRef = useRef<string | null>(null);
   const reconnectAttemptRef = useRef(0);
   const browserReconnectTimer = useRef<number | null>(null);
+  const transcriptRetryAttemptRef = useRef(0);
+  const transcriptRetryTimer = useRef<number | null>(null);
 
   const host =
     hosts.find((candidate) => candidate.hostId === hostId) ?? hosts[0];
@@ -513,7 +516,25 @@ export default function App() {
 
   useEffect(() => {
     if (demo || !channel || !sessionId) return;
+    if (transcriptRetryTimer.current !== null) {
+      window.clearTimeout(transcriptRetryTimer.current);
+      transcriptRetryTimer.current = null;
+    }
+    transcriptRetryAttemptRef.current = 0;
     void refreshSession(sessionId, channel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel, demo, sessionId]);
+
+  useEffect(() => {
+    if (demo || !channel || !sessionId) return;
+    const reconcileWhenVisible = () => {
+      if (document.visibilityState === "visible")
+        void reconcileTranscript(sessionId);
+    };
+    document.addEventListener("visibilitychange", reconcileWhenVisible);
+    return () =>
+      document.removeEventListener("visibilitychange", reconcileWhenVisible);
+    // Visibility recovery always targets the current encrypted channel and session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channel, demo, sessionId]);
 
@@ -640,6 +661,8 @@ export default function App() {
       if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
       if (browserReconnectTimer.current !== null)
         window.clearTimeout(browserReconnectTimer.current);
+      if (transcriptRetryTimer.current !== null)
+        window.clearTimeout(transcriptRetryTimer.current);
     },
     [],
   );
@@ -940,6 +963,9 @@ export default function App() {
       if (transcriptResult) {
         setTranscript(transcriptFromPage(transcriptResult));
         setTranscriptSessionId(targetSessionId);
+        clearTranscriptRetry();
+      } else {
+        scheduleTranscriptRetry(targetSessionId);
       }
       setApprovals(snapshot.pendingApprovals ?? []);
       setQuestions(snapshot.pendingQuestions ?? []);
@@ -996,6 +1022,7 @@ export default function App() {
             next = applied.state;
           }
           if (activeSessionRef.current === targetSessionId) setTranscript(next);
+          clearTranscriptRetry();
           return;
         }
       } catch {
@@ -1014,12 +1041,36 @@ export default function App() {
       if (activeSessionRef.current === targetSessionId) {
         setTranscript(transcriptFromPage(page));
         setTranscriptSessionId(targetSessionId);
+        clearTranscriptRetry();
       }
     } catch (nextError) {
       setError(
         nextError instanceof Error ? nextError.message : "恢复对话记录失败",
       );
+      scheduleTranscriptRetry(targetSessionId);
     }
+  }
+
+  function clearTranscriptRetry() {
+    if (transcriptRetryTimer.current !== null)
+      window.clearTimeout(transcriptRetryTimer.current);
+    transcriptRetryTimer.current = null;
+    transcriptRetryAttemptRef.current = 0;
+  }
+
+  function scheduleTranscriptRetry(targetSessionId: string) {
+    if (
+      transcriptRetryTimer.current !== null ||
+      !channelRef.current ||
+      activeSessionRef.current !== targetSessionId
+    )
+      return;
+    const delay = transcriptRetryDelay(transcriptRetryAttemptRef.current);
+    transcriptRetryAttemptRef.current += 1;
+    transcriptRetryTimer.current = window.setTimeout(() => {
+      transcriptRetryTimer.current = null;
+      void reconcileTranscript(targetSessionId);
+    }, delay);
   }
 
   async function loadOlderTurns() {

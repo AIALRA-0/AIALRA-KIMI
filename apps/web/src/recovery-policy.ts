@@ -1,0 +1,7 @@
+export function transcriptRetryDelay(
+  attempt: number,
+  random = Math.random,
+): number {
+  const ceiling = Math.min(500 * 2 ** Math.max(0, attempt), 15_000);
+  return Math.round(ceiling * (0.65 + random() * 0.35));
+}

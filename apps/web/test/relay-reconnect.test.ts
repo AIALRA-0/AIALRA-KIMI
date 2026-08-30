@@ -142,4 +142,12 @@ describe("browser relay recovery", () => {
     });
     await expect(secondAttempt).rejects.toThrow("主机已离线");
   });
+
+  it("bounds transcript recovery retries with jitter", async () => {
+    const { transcriptRetryDelay } = await import("../src/recovery-policy.js");
+    expect(transcriptRetryDelay(0, () => 0)).toBe(325);
+    expect(transcriptRetryDelay(0, () => 1)).toBe(500);
+    expect(transcriptRetryDelay(20, () => 0)).toBe(9_750);
+    expect(transcriptRetryDelay(20, () => 1)).toBe(15_000);
+  });
 });
