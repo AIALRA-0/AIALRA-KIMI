@@ -1,0 +1,205 @@
+{
+  "$schema": "../schemas/upstream-feature-matrix.schema.json",
+  "upstreamVersion": "0.39.1",
+  "source": "https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/kimi-web.md",
+  "statuses": {
+    "native": "The upstream behavior is exposed through the pinned Kimi protocol",
+    "secured": "The behavior is preserved with an additional AIALRA security gate",
+    "substituted": "The unsafe or host-GUI behavior has a browser-safe equivalent"
+  },
+  "features": [
+    {
+      "id": "conversation-transcript-v2",
+      "status": "native",
+      "operations": ["sessions.transcript.read", "sessions.transcript.resume"],
+      "evidence": "ConversationTimeline.tsx renders official transcript turns, parts, offsets, and states"
+    },
+    {
+      "id": "reasoning-and-progress",
+      "status": "native",
+      "operations": ["sessions.transcript.read", "sessions.events"],
+      "evidence": "Official thinking, step, tool, retry, task, subagent, and compaction parts are rendered without inference"
+    },
+    {
+      "id": "nested-turn-folding",
+      "status": "native",
+      "operations": ["sessions.transcript.read"],
+      "evidence": "Completed prior turns fold intermediate parts while user input and final output remain visible"
+    },
+    {
+      "id": "session-lifecycle",
+      "status": "native",
+      "operations": [
+        "sessions.list",
+        "sessions.create",
+        "sessions.archive",
+        "sessions.fork"
+      ],
+      "evidence": "The host sidebar and session header expose the supported upstream lifecycle"
+    },
+    {
+      "id": "permanent-session-deletion",
+      "status": "secured",
+      "operations": ["sessions.archive"],
+      "evidence": "The default remote action is recoverable archive",
+      "securityRationale": "Permanent deletion is intentionally unavailable until step-up authentication and item-by-item confirmation are present"
+    },
+    {
+      "id": "prompt-stream-and-idempotency",
+      "status": "native",
+      "operations": ["sessions.prompt", "sessions.interrupt"],
+      "evidence": "Stable prompt IDs and transcript cursors prevent duplicate submission and duplicate rendering"
+    },
+    {
+      "id": "prompt-queue",
+      "status": "native",
+      "operations": [
+        "sessions.prompts.list",
+        "sessions.prompts.steer",
+        "sessions.prompts.abort"
+      ],
+      "evidence": "The composer exposes queued prompts, steering, and cancellation"
+    },
+    {
+      "id": "slash-commands",
+      "status": "native",
+      "operations": ["sessions.commands.list", "sessions.commands.execute"],
+      "evidence": "The composer provides pinned built-ins plus host-discovered commands and skills"
+    },
+    {
+      "id": "host-gui-commands",
+      "status": "substituted",
+      "operations": ["sessions.commands.execute"],
+      "evidence": "Unsupported host-GUI commands return a visible reason",
+      "securityRationale": "Remote sessions never launch arbitrary applications on the execution host"
+    },
+    {
+      "id": "workspace-file-mentions",
+      "status": "native",
+      "operations": ["sessions.files.search", "sessions.files.read"],
+      "evidence": "At-sign completion and the workspace panel use host-scoped file RPC"
+    },
+    {
+      "id": "attachments-and-media",
+      "status": "native",
+      "operations": ["sessions.attachments.upload", "sessions.media.read"],
+      "evidence": "The composer uploads attachments and transcript parts use bounded media reads"
+    },
+    {
+      "id": "markdown-and-code",
+      "status": "native",
+      "operations": ["sessions.transcript.read"],
+      "evidence": "MarkdownRenderer.tsx handles prose, links, tables, fenced code, and media"
+    },
+    {
+      "id": "approvals-and-questions",
+      "status": "native",
+      "operations": [
+        "sessions.approvals.respond",
+        "sessions.questions.respond",
+        "sessions.questions.dismiss"
+      ],
+      "evidence": "Structured interactions are rendered from the current host snapshot"
+    },
+    {
+      "id": "tasks-and-plan",
+      "status": "native",
+      "operations": [
+        "sessions.tasks.list",
+        "sessions.tasks.cancel",
+        "sessions.tasks.detach"
+      ],
+      "evidence": "The activity panel and composer expose tasks and Plan mode"
+    },
+    {
+      "id": "context-and-model-settings",
+      "status": "native",
+      "operations": [
+        "sessions.models.list",
+        "sessions.permission.read",
+        "sessions.permission.write"
+      ],
+      "evidence": "Context usage, model, thinking level, and permission controls reflect host state"
+    },
+    {
+      "id": "git-file-changes",
+      "status": "native",
+      "operations": ["sessions.files.status"],
+      "evidence": "The activity panel renders host-reported Git changes"
+    },
+    {
+      "id": "compact-undo-btw-title",
+      "status": "native",
+      "operations": [
+        "sessions.compact",
+        "sessions.undo",
+        "sessions.btw",
+        "sessions.title.write"
+      ],
+      "evidence": "Session commands call dedicated upstream endpoints"
+    },
+    {
+      "id": "skills-and-plugins",
+      "status": "secured",
+      "operations": ["sessions.skills.list", "sessions.skills.activate"],
+      "evidence": "Approved host capabilities can be discovered and activated",
+      "securityRationale": "Arbitrary plugin installation and provider-secret mutation remain local-only"
+    },
+    {
+      "id": "session-export",
+      "status": "secured",
+      "operations": ["sessions.export"],
+      "evidence": "Exports stream through the encrypted channel with a fixed size limit",
+      "securityRationale": "Export content is never persisted by the control plane"
+    },
+    {
+      "id": "account-and-usage",
+      "status": "native",
+      "operations": [
+        "oauth.userinfo",
+        "oauth.usage",
+        "oauth.device.start",
+        "oauth.device.poll"
+      ],
+      "evidence": "Account state and every upstream usage window are read on the selected host"
+    },
+    {
+      "id": "standard-terminal",
+      "status": "secured",
+      "operations": [
+        "terminal.open",
+        "terminal.resume",
+        "terminal.input",
+        "terminal.resize",
+        "terminal.close"
+      ],
+      "evidence": "The browser terminal uses a host-bound encrypted relay",
+      "securityRationale": "Terminal frames are bounded, audited by category, and never stored by the control plane"
+    },
+    {
+      "id": "elevated-terminal",
+      "status": "secured",
+      "operations": [
+        "terminal.elevate.open",
+        "terminal.elevate.input",
+        "terminal.resize",
+        "terminal.close"
+      ],
+      "evidence": "Elevation uses a separate broker and short-lived authorization",
+      "securityRationale": "Elevation requires step-up authentication and terminates on disconnect or timeout"
+    },
+    {
+      "id": "remote-recovery",
+      "status": "native",
+      "operations": ["sessions.transcript.resume", "terminal.resume"],
+      "evidence": "Browser reconnect preserves the selected host, session, transcript, and fold state"
+    },
+    {
+      "id": "multi-host-isolation",
+      "status": "secured",
+      "operations": ["sessions.list", "sessions.transcript.read"],
+      "evidence": "Every session reference and grant is bound to a host ID",
+      "securityRationale": "Identical upstream session IDs on different hosts cannot share authorization or state"
+    }
+  ]
+}

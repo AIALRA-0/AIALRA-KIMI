@@ -16,7 +16,8 @@
   },
   "scripts": {
     "build": "pnpm -r --if-present build",
-    "check": "pnpm format:check && pnpm -r --if-present check && pnpm test",
+    "check": "pnpm format:check && pnpm check:feature-matrix && pnpm -r --if-present check && pnpm test",
+    "check:feature-matrix": "node scripts/check-feature-matrix.mjs",
     "dev": "pnpm --parallel --filter @aialra-kimi/control-plane --filter @aialra-kimi/web dev",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
