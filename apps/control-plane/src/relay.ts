@@ -471,8 +471,17 @@ export class RelayService {
         connection.channels.delete(envelope.channelId);
       }
       const agent = this.agents.get(envelope.hostId);
-      if (!agent)
-        return send(socket, { type: "server.error", code: "host_offline" });
+      if (!agent) {
+        if (envelope.type === "browser.channel.close") return;
+        return send(socket, {
+          type: "server.error",
+          requestId:
+            envelope.type === "browser.channel.open"
+              ? envelope.requestId
+              : undefined,
+          code: "host_offline",
+        });
+      }
       send(agent.socket, { ...envelope, subject: principal.subject });
     });
     socket.on("close", () => {

@@ -44,6 +44,7 @@ function pemRawKey(pem: string): Uint8Array {
 interface ChannelState {
   hostId: string;
   channelId: string;
+  openRequestId: string;
   channel: "kimi" | "terminal" | "elevated-terminal";
   privateKey: Uint8Array;
   browserPublicKey: string;
@@ -87,6 +88,7 @@ export class BrowserRelay {
     const privateKey = x25519.utils.randomSecretKey();
     const publicKey = x25519.getPublicKey(privateKey);
     const channelId = crypto.randomUUID();
+    const openRequestId = crypto.randomUUID();
     let resolveReady!: () => void;
     let rejectReady!: (error: Error) => void;
     const ready = new Promise<void>((resolve, reject) => {
@@ -96,6 +98,7 @@ export class BrowserRelay {
     const state: ChannelState = {
       hostId,
       channelId,
+      openRequestId,
       channel,
       privateKey,
       browserPublicKey: base64url(publicKey),
@@ -110,22 +113,26 @@ export class BrowserRelay {
       onEvent,
     };
     this.channels.set(channelId, state);
-    this.send({
-      type: "browser.channel.open",
-      requestId: crypto.randomUUID(),
-      hostId,
-      channelId,
-      channel,
-      browserEphemeralKey: state.browserPublicKey,
-      grant: token,
-    });
-    await Promise.race([
-      ready,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("代理通道连接超时")), 10_000),
-      ),
-    ]);
-    return new RelayChannel(this, state);
+    try {
+      this.send({
+        type: "browser.channel.open",
+        requestId: openRequestId,
+        hostId,
+        channelId,
+        channel,
+        browserEphemeralKey: state.browserPublicKey,
+        grant: token,
+      });
+      await this.waitUntilReady(state);
+      return new RelayChannel(this, state);
+    } catch (error) {
+      this.discardChannel(
+        state,
+        error instanceof Error ? error : new Error("代理通道连接失败"),
+        true,
+      );
+      throw error;
+    }
   }
 
   async rpc(
@@ -171,16 +178,7 @@ export class BrowserRelay {
   }
 
   close(state: ChannelState): void {
-    this.channels.delete(state.channelId);
-    for (const pending of state.pending.values())
-      pending.reject(new Error("通道已关闭"));
-    state.pending.clear();
-    this.send({
-      type: "browser.channel.close",
-      hostId: state.hostId,
-      channelId: state.channelId,
-      reason: "user",
-    });
+    this.discardChannel(state, new Error("通道已关闭"), true);
   }
 
   private async connect(): Promise<void> {
@@ -191,25 +189,45 @@ export class BrowserRelay {
     this.socketReady = new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(url);
       this.socket = socket;
-      socket.addEventListener("open", () => resolve(), { once: true });
+      let ready = false;
+      const readyTimer = setTimeout(() => {
+        reject(new Error("中继连接超时"));
+        socket.close();
+      }, 10_000);
       socket.addEventListener(
         "error",
-        () => reject(new Error("中继连接失败")),
+        () => {
+          clearTimeout(readyTimer);
+          reject(new Error("中继连接失败"));
+        },
         { once: true },
       );
-      socket.addEventListener(
-        "message",
-        (event) => void this.onMessage(String(event.data)),
-      );
+      socket.addEventListener("message", (event) => {
+        const raw = String(event.data);
+        try {
+          const message = JSON.parse(raw) as Record<string, unknown>;
+          if (message.type === "server.browser.ready") {
+            ready = true;
+            clearTimeout(readyTimer);
+            resolve();
+            return;
+          }
+        } catch {
+          return;
+        }
+        void this.onMessage(raw);
+      });
       socket.addEventListener("close", () => {
+        clearTimeout(readyTimer);
+        if (!ready) reject(new Error("中继已断开"));
         this.socket = null;
         this.socketReady = null;
         for (const channel of this.channels.values()) {
           channel.rejectReady(new Error("中继已断开"));
+          channel.onEvent({ type: "channel.disconnected" });
           for (const pending of channel.pending.values())
             pending.reject(new Error("中继已断开"));
           channel.pending.clear();
-          channel.onEvent({ type: "channel.disconnected" });
         }
         this.channels.clear();
       });
@@ -224,7 +242,21 @@ export class BrowserRelay {
   }
 
   private async onMessage(raw: string): Promise<void> {
-    const message = JSON.parse(raw) as Record<string, unknown>;
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (message.type === "server.host.offline") {
+      const hostId = String(message.hostId);
+      for (const channel of [...this.channels.values()]) {
+        if (channel.hostId !== hostId) continue;
+        channel.onEvent({ type: "channel.disconnected" });
+        this.discardChannel(channel, new Error("主机已离线"), true);
+      }
+      return;
+    }
     if (message.type === "agent.channel.accept") {
       const channel = this.channels.get(String(message.channelId));
       if (!channel) return;
@@ -294,7 +326,62 @@ export class BrowserRelay {
       return;
     }
     if (message.type === "server.error") {
+      const requestId =
+        typeof message.requestId === "string" ? message.requestId : null;
+      if (requestId) {
+        const opening = [...this.channels.values()].find(
+          (channel) => channel.openRequestId === requestId,
+        );
+        if (opening) {
+          opening.rejectReady(
+            new Error(
+              message.code === "host_offline"
+                ? "主机已离线"
+                : `代理通道连接失败（${String(message.code ?? "unknown")}）`,
+            ),
+          );
+          return;
+        }
+      }
       for (const channel of this.channels.values()) channel.onEvent(message);
+    }
+  }
+
+  private async waitUntilReady(state: ChannelState): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        state.ready,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("代理通道连接超时")),
+            10_000,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  }
+
+  private discardChannel(
+    state: ChannelState,
+    error: Error,
+    notifyAgent = false,
+  ): void {
+    if (!this.channels.delete(state.channelId)) return;
+    state.rejectReady(error);
+    for (const pending of state.pending.values()) pending.reject(error);
+    state.pending.clear();
+    if (notifyAgent && this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(
+        JSON.stringify({
+          type: "browser.channel.close",
+          hostId: state.hostId,
+          channelId: state.channelId,
+          reason: "user",
+        }),
+      );
     }
   }
 }
