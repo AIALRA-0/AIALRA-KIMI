@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -29,6 +32,7 @@ use crate::{
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RELAY_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_ACTIVE_CHANNELS: usize = 16;
+const MAX_RELAY_SILENCE: Duration = Duration::from_secs(45);
 
 struct AbortOnDrop<T>(JoinHandle<T>);
 
@@ -167,7 +171,7 @@ async fn run_connection(
         .context("failed to connect to the relay")?;
     let (mut websocket_sink, mut websocket_stream) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Value>(256);
-    let _writer = AbortOnDrop(tokio::spawn(async move {
+    let mut writer = AbortOnDrop(tokio::spawn(async move {
         while let Some(value) = outgoing_rx.recv().await {
             websocket_sink
                 .send(Message::Text(value.to_string().into()))
@@ -186,16 +190,24 @@ async fn run_connection(
     let grant_verification_key = verifying_key_from_pem(&config.grant_verification_key)?;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut heartbeat_watchdog = tokio::time::interval(Duration::from_secs(5));
+    heartbeat_watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut cache_refresh = tokio::time::interval(Duration::from_secs(60));
     cache_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut authenticated = false;
     let mut compatible = false;
+    let mut last_relay_activity = Instant::now();
 
     loop {
         tokio::select! {
+            writer_result = &mut writer.0 => {
+                writer_result.context("relay writer task failed")??;
+                bail!("relay writer ended unexpectedly");
+            }
             inbound = websocket_stream.next() => {
                 let Some(inbound) = inbound else { break };
                 let message = inbound?;
+                last_relay_activity = Instant::now();
                 match message {
                     Message::Text(text) => {
                         if text.len() > MAX_RELAY_MESSAGE_BYTES {
@@ -347,6 +359,11 @@ async fn run_connection(
                     }
                 }
             }
+            _ = heartbeat_watchdog.tick() => {
+                if authenticated && relay_silence_exceeded(last_relay_activity.elapsed()) {
+                    bail!("relay heartbeat acknowledgement timed out");
+                }
+            }
             _ = cache_refresh.tick(), if authenticated && compatible => {
                 if let Err(error) = send_session_cache(&outgoing_tx, config, kimi).await {
                     warn!(error = %error, "failed to refresh the redacted session cache");
@@ -356,6 +373,10 @@ async fn run_connection(
     }
     drop(outgoing_tx);
     Ok(())
+}
+
+fn relay_silence_exceeded(elapsed: Duration) -> bool {
+    elapsed > MAX_RELAY_SILENCE
 }
 
 async fn process_browser_frame(
@@ -669,5 +690,11 @@ mod tests {
         assert!(channel_capacity_allows(MAX_ACTIVE_CHANNELS - 1, false));
         assert!(!channel_capacity_allows(MAX_ACTIVE_CHANNELS, false));
         assert!(!channel_capacity_allows(0, true));
+    }
+
+    #[test]
+    fn expires_a_zombie_relay_connection() {
+        assert!(!relay_silence_exceeded(Duration::from_secs(45)));
+        assert!(relay_silence_exceeded(Duration::from_secs(46)));
     }
 }
