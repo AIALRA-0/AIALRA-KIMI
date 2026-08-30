@@ -195,6 +195,16 @@ export function transcriptFromPage(page: TranscriptPage): TranscriptState {
   };
 }
 
+export function applyTranscriptReset(
+  current: TranscriptState | null,
+  page: TranscriptPage,
+): TranscriptState {
+  const next = transcriptFromPage(page);
+  if (!current || current.items.length === 0 || next.items.length > 0)
+    return next;
+  return current;
+}
+
 export function prependTranscriptPage(
   state: TranscriptState,
   page: TranscriptPage,

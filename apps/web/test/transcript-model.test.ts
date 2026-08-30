@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyTranscriptReset,
   applyTranscriptOps,
   transcriptFromPage,
   type TranscriptPage,
@@ -106,5 +107,14 @@ describe("transcript v2 reducer", () => {
   it("signals a sequence gap for REST catch-up", () => {
     const state = transcriptFromPage(page());
     expect(applyTranscriptOps(state, [], 13).gap).toBe(true);
+  });
+
+  it("does not erase a recovered transcript with an empty stale reset", () => {
+    const current = transcriptFromPage({ ...page(), seq: 12 });
+    const staleReset = { ...page(), items: [], seq: 12 };
+    expect(applyTranscriptReset(current, staleReset)).toBe(current);
+    expect(applyTranscriptReset(current, { ...staleReset, seq: 13 })).toBe(
+      current,
+    );
   });
 });

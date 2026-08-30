@@ -69,6 +69,7 @@ import { BrowserRelay, type RelayChannel } from "./relay.js";
 import { TerminalPanel } from "./TerminalPanel.js";
 import { TranscriptTimeline } from "./TranscriptTimeline.js";
 import {
+  applyTranscriptReset,
   applyTranscriptOps,
   emptyTranscript,
   prependTranscriptPage,
@@ -698,7 +699,7 @@ export default function App() {
           ? { seq: event.payload.seq }
           : {}),
       };
-      setTranscript(transcriptFromPage(page));
+      setTranscript((current) => applyTranscriptReset(current, page));
       setTranscriptSessionId(selected);
       return;
     }
