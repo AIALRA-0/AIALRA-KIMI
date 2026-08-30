@@ -216,6 +216,19 @@ export function mergeTranscriptPage(
     : transcriptFromPage(page);
 }
 
+export function shouldRenderTranscript(
+  transcript: TranscriptState | null,
+  transcriptSessionId: string,
+  sessionId: string,
+  fallbackMessageCount: number,
+): boolean {
+  return Boolean(
+    transcript &&
+      transcriptSessionId === sessionId &&
+      (transcript.items.length > 0 || fallbackMessageCount === 0),
+  );
+}
+
 export function prependTranscriptPage(
   state: TranscriptState,
   page: TranscriptPage,

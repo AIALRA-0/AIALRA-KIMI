@@ -74,6 +74,7 @@ import {
   emptyTranscript,
   mergeTranscriptPage,
   prependTranscriptPage,
+  shouldRenderTranscript,
   transcriptFromPage,
   type TranscriptOperation,
   type TranscriptPage,
@@ -312,6 +313,7 @@ export default function App() {
   const attachmentInput = useRef<HTMLInputElement>(null);
   const channelRef = useRef<RelayChannel | null>(null);
   const activeSessionRef = useRef(sessionId);
+  const messagesRef = useRef(messages);
   const cursorRef = useRef(new Map<string, number>());
   const refreshTimer = useRef<number | null>(null);
   const oauthTimer = useRef<number | null>(null);
@@ -349,6 +351,10 @@ export default function App() {
   useEffect(() => {
     activeSessionRef.current = sessionId;
   }, [sessionId]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     if (!demo && hostId) localStorage.setItem("aialra-selected-host", hostId);
@@ -959,9 +965,12 @@ export default function App() {
       if (activeSessionRef.current !== targetSessionId) return;
       cursorRef.current.set(targetSessionId, snapshot.asOfSeq);
       setLastSequence(snapshot.asOfSeq);
-      setMessages(
-        withInFlightMessage(snapshot.messages, snapshot.inFlightTurn),
+      const snapshotMessages = withInFlightMessage(
+        snapshot.messages,
+        snapshot.inFlightTurn,
       );
+      messagesRef.current = snapshotMessages;
+      setMessages(snapshotMessages);
       if (transcriptResult) {
         setTranscript((current) =>
           mergeTranscriptPage(
@@ -972,7 +981,9 @@ export default function App() {
           ),
         );
         setTranscriptSessionId(targetSessionId);
-        clearTranscriptRetry();
+        if (transcriptResult.items.length > 0 || snapshotMessages.length === 0)
+          clearTranscriptRetry();
+        else scheduleTranscriptRetry(targetSessionId);
       } else {
         scheduleTranscriptRetry(targetSessionId);
       }
@@ -1058,8 +1069,12 @@ export default function App() {
           ),
         );
         setTranscriptSessionId(targetSessionId);
-        clearTranscriptRetry();
-        setError(null);
+        if (page.items.length > 0 || messagesRef.current.length === 0) {
+          clearTranscriptRetry();
+          setError(null);
+        } else {
+          scheduleTranscriptRetry(targetSessionId);
+        }
       }
     } catch (nextError) {
       setError(
@@ -2028,10 +2043,14 @@ export default function App() {
                   <Clock3 size={14} />
                   <span>会话记录</span>
                 </div>
-                {transcript &&
-                transcriptSessionId === session?.upstreamSessionId ? (
+                {shouldRenderTranscript(
+                  transcript,
+                  transcriptSessionId,
+                  session?.upstreamSessionId ?? "",
+                  conversationMessages.length,
+                ) ? (
                   <TranscriptTimeline
-                    transcript={transcript}
+                    transcript={transcript!}
                     hostId={host?.hostId ?? ""}
                     sessionId={session?.upstreamSessionId ?? ""}
                     onLoadOlder={() => void loadOlderTurns()}

@@ -3,6 +3,7 @@ import {
   applyTranscriptReset,
   applyTranscriptOps,
   mergeTranscriptPage,
+  shouldRenderTranscript,
   transcriptFromPage,
   type TranscriptPage,
 } from "../src/transcript-model.js";
@@ -128,5 +129,23 @@ describe("transcript v2 reducer", () => {
     expect(
       mergeTranscriptPage(current, "session-1", "session-2", emptyPage).items,
     ).toEqual([]);
+  });
+
+  it("falls back to legacy messages while transcript recovery is empty", () => {
+    const empty = transcriptFromPage({ ...page(), items: [] });
+    expect(shouldRenderTranscript(empty, "session-1", "session-1", 2)).toBe(
+      false,
+    );
+    expect(shouldRenderTranscript(empty, "session-1", "session-1", 0)).toBe(
+      true,
+    );
+    expect(
+      shouldRenderTranscript(
+        transcriptFromPage(page()),
+        "session-1",
+        "session-1",
+        2,
+      ),
+    ).toBe(true);
   });
 });
