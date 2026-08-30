@@ -1024,6 +1024,7 @@ export default function App() {
           }
           if (activeSessionRef.current === targetSessionId) setTranscript(next);
           clearTranscriptRetry();
+          setError(null);
           return;
         }
       } catch {
@@ -1043,6 +1044,7 @@ export default function App() {
         setTranscript(transcriptFromPage(page));
         setTranscriptSessionId(targetSessionId);
         clearTranscriptRetry();
+        setError(null);
       }
     } catch (nextError) {
       setError(
