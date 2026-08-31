@@ -69,7 +69,7 @@ import { MarkdownMessage, ToolMessage } from "./MessageBody.js";
 import { supportedEfforts } from "./model-options.js";
 import { NewSessionDialog, type NewSessionInput } from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
-import { transcriptRetryDelay } from "./recovery-policy.js";
+import { relayRetryDelay, transcriptRetryDelay } from "./recovery-policy.js";
 import { BrowserRelay, type RelayChannel } from "./relay.js";
 import { TerminalPanel } from "./TerminalPanel.js";
 import { TranscriptTimeline } from "./TranscriptTimeline.js";
@@ -99,6 +99,7 @@ import {
   type UiSessionSnapshot,
   type UiSessionStatus,
   type UiTask,
+  type KimiEventEnvelope,
 } from "./session-model.js";
 
 type MainView = "conversation" | "terminal" | "account" | "settings";
@@ -310,6 +311,9 @@ export default function App() {
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [sending, setSending] = useState(false);
+  const [optimisticMessage, setOptimisticMessage] = useState<UiMessage | null>(
+    null,
+  );
   const [modelOptions, setModelOptions] = useState<ModelDescriptor[]>([]);
   const [selectedModel, setSelectedModel] = useState(demo ? "kimi-code" : "");
   const [thinkingLevel, setThinkingLevel] = useState(demo ? "high" : "");
@@ -343,8 +347,13 @@ export default function App() {
   const channelRef = useRef<RelayChannel | null>(null);
   const activeSessionRef = useRef(sessionId);
   const messagesRef = useRef(messages);
+  const transcriptRef = useRef<TranscriptState | null>(transcript);
+  const transcriptSessionIdRef = useRef(transcriptSessionId);
+  const transcriptEventQueueRef = useRef<KimiEventEnvelope[]>([]);
+  const transcriptFlushFrameRef = useRef<number | null>(null);
   const cursorRef = useRef(new Map<string, number>());
   const refreshTimer = useRef<number | null>(null);
+  const refreshGenerationRef = useRef(0);
   const oauthTimer = useRef<number | null>(null);
   const oauthHostRef = useRef<string | null>(null);
   const connectedHostRef = useRef<string | null>(null);
@@ -409,6 +418,12 @@ export default function App() {
         : [],
     [transcript],
   );
+  const transcriptVisible = shouldRenderTranscript(
+    transcript,
+    transcriptSessionId,
+    session?.upstreamSessionId ?? "",
+    conversationMessages.length,
+  );
 
   useEffect(() => {
     activeSessionRef.current = sessionId;
@@ -417,6 +432,30 @@ export default function App() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  useEffect(() => {
+    transcriptSessionIdRef.current = transcriptSessionId;
+  }, [transcriptSessionId]);
+
+  useEffect(() => {
+    if (!optimisticMessage || !transcript) return;
+    const sentAt = Date.parse(optimisticMessage.time);
+    const matched = transcript.items.some((item) => {
+      if (item.kind !== "turn") return false;
+      if (item.prompt?.trim() === optimisticMessage.text.trim()) return true;
+      const startedAt = Date.parse(item.startedAt ?? "");
+      return (
+        Number.isFinite(sentAt) &&
+        Number.isFinite(startedAt) &&
+        startedAt >= sentAt - 1_000
+      );
+    });
+    if (matched) setOptimisticMessage(null);
+  }, [optimisticMessage, transcript]);
 
   useEffect(() => {
     if (!demo && hostId) localStorage.setItem("aialra-selected-host", hostId);
@@ -516,6 +555,7 @@ export default function App() {
     if (demo || !host) return;
     let disposed = false;
     let opened: RelayChannel | null = null;
+    const abortController = new AbortController();
     const changingHost = connectedHostRef.current !== host.hostId;
     connectedHostRef.current = host.hostId;
     channelRef.current?.close();
@@ -525,7 +565,10 @@ export default function App() {
       setSessions([]);
       setSessionId("");
       setMessages([]);
+      setOptimisticMessage(null);
+      transcriptRef.current = null;
       setTranscript(null);
+      transcriptSessionIdRef.current = "";
       setTranscriptSessionId("");
       setTasks([]);
       setApprovals([]);
@@ -540,6 +583,7 @@ export default function App() {
     }
     oauthHostRef.current = null;
     if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
+    setStatus("等待代理启动");
     void (async () => {
       try {
         if (host.state === "offline" || host.state === "unsupported") {
@@ -560,30 +604,35 @@ export default function App() {
           "kimi",
           [...kimiScopes],
           handleAgentEvent,
+          abortController.signal,
         );
-        if (disposed) return opened.close();
+        if (disposed || abortController.signal.aborted) return opened.close();
         channelRef.current = opened;
-        const [sessionResult, usageResult] = await Promise.all([
-          opened.rpc<{ sessions: UiSession[] }>("sessions.list"),
-          opened.rpc<UsageSnapshot>("oauth.usage").catch(() => null),
-        ]);
-        if (!disposed) {
-          setChannel(opened);
-          setSessions(sessionResult.sessions);
-          setSessionId((current) =>
-            sessionResult.sessions.some(
-              (item) => item.upstreamSessionId === current,
-            )
-              ? current
-              : (sessionResult.sessions[0]?.upstreamSessionId ?? ""),
-          );
-          setUsage(usageResult);
-          setError(null);
-          setStatus("在线 · 端到端加密");
-          reconnectAttemptRef.current = 0;
-        }
+        setChannel(opened);
+        setError(null);
+        setStatus("在线 · 端到端加密");
+        reconnectAttemptRef.current = 0;
+        const sessionResult = await opened.rpc<{ sessions: UiSession[] }>(
+          "sessions.list",
+        );
+        if (disposed || abortController.signal.aborted) return;
+        setSessions(sessionResult.sessions);
+        setSessionId((current) =>
+          sessionResult.sessions.some(
+            (item) => item.upstreamSessionId === current,
+          )
+            ? current
+            : (sessionResult.sessions[0]?.upstreamSessionId ?? ""),
+        );
+        void opened
+          .rpc<UsageSnapshot>("oauth.usage")
+          .then((snapshot) => {
+            if (!disposed && !abortController.signal.aborted)
+              setUsage(snapshot);
+          })
+          .catch(() => undefined);
       } catch (nextError) {
-        if (!disposed) {
+        if (!disposed && !abortController.signal.aborted) {
           setError(
             nextError instanceof Error ? nextError.message : "主机通道连接失败",
           );
@@ -594,6 +643,7 @@ export default function App() {
     })();
     return () => {
       disposed = true;
+      abortController.abort();
       opened?.close();
       if (channelRef.current === opened) channelRef.current = null;
     };
@@ -682,6 +732,7 @@ export default function App() {
     }
     let disposed = false;
     let opened: RelayChannel | null = null;
+    const abortController = new AbortController();
     terminalChannel?.close();
     void relay
       .open(
@@ -721,6 +772,7 @@ export default function App() {
             );
           }
         },
+        abortController.signal,
       )
       .then((nextChannel) => {
         opened = nextChannel;
@@ -740,6 +792,7 @@ export default function App() {
       });
     return () => {
       disposed = true;
+      abortController.abort();
       opened?.close();
       setTerminalChannel(null);
     };
@@ -756,6 +809,13 @@ export default function App() {
         window.clearTimeout(browserReconnectTimer.current);
       if (transcriptRetryTimer.current !== null)
         window.clearTimeout(transcriptRetryTimer.current);
+      if (transcriptFlushFrameRef.current !== null) {
+        if (typeof window.cancelAnimationFrame === "function")
+          window.cancelAnimationFrame(transcriptFlushFrameRef.current);
+        else window.clearTimeout(transcriptFlushFrameRef.current);
+      }
+      transcriptFlushFrameRef.current = null;
+      transcriptEventQueueRef.current = [];
     },
     [],
   );
@@ -764,55 +824,19 @@ export default function App() {
     const event = decodeKimiEvent(raw);
     if (!event) return;
     if (event.type === "channel.disconnected") {
+      channelRef.current = null;
+      setChannel(null);
       setStatus("正在重连");
       scheduleBrowserReconnect();
       return;
     }
     const selected = activeSessionRef.current;
     if (event.type === "transcript.reset") {
-      const snapshot = event.payload.snapshot as
-        | Record<string, unknown>
-        | undefined;
-      if (!snapshot || event.sessionId !== selected) return;
-      const page: TranscriptPage = {
-        agent_id: String(event.payload.agent_id ?? "main"),
-        items: (snapshot.items as TranscriptPage["items"]) ?? [],
-        has_more: Boolean(event.payload.has_more_older),
-        tasks: (snapshot.tasks as TranscriptPage["tasks"]) ?? [],
-        interactions: (snapshot.interactions as unknown[]) ?? [],
-        attachments:
-          (snapshot.attachments as TranscriptPage["attachments"]) ?? [],
-        todos: (snapshot.todos as TranscriptPage["todos"]) ?? [],
-        prompts: (snapshot.prompts as TranscriptPage["prompts"]) ?? [],
-        meta: (snapshot.meta as Record<string, unknown>) ?? {},
-        agents: [],
-        pending_interactions: [],
-        ...(typeof event.payload.seq === "number"
-          ? { seq: event.payload.seq }
-          : {}),
-      };
-      setTranscript((current) => applyTranscriptReset(current, page));
-      setTranscriptSessionId(selected);
+      queueTranscriptEvent(event);
       return;
     }
     if (event.type === "transcript.ops") {
-      if (event.sessionId !== selected) return;
-      const operations = Array.isArray(event.payload.ops)
-        ? (event.payload.ops as TranscriptOperation[])
-        : [];
-      const sequence =
-        typeof event.payload.seq === "number" ? event.payload.seq : undefined;
-      setTranscript((current) => {
-        const base =
-          current && transcriptSessionId === selected
-            ? current
-            : emptyTranscript(String(event.payload.agent_id ?? "main"));
-        const result = applyTranscriptOps(base, operations, sequence);
-        if (result.gap)
-          window.setTimeout(() => void reconcileTranscript(selected), 0);
-        return result.state;
-      });
-      setTranscriptSessionId(selected);
+      queueTranscriptEvent(event);
       return;
     }
     if (event.type === "resync_required") {
@@ -983,6 +1007,83 @@ export default function App() {
       scheduleRefresh();
   }
 
+  function queueTranscriptEvent(event: KimiEventEnvelope) {
+    if (event.sessionId !== activeSessionRef.current) return;
+    transcriptEventQueueRef.current.push(event);
+    if (transcriptFlushFrameRef.current !== null) return;
+    const flush = () => {
+      transcriptFlushFrameRef.current = null;
+      flushTranscriptEvents();
+    };
+    if (typeof window.requestAnimationFrame === "function")
+      transcriptFlushFrameRef.current = window.requestAnimationFrame(flush);
+    else
+      transcriptFlushFrameRef.current = window.setTimeout(
+        flush,
+        16,
+      ) as unknown as number;
+  }
+
+  function flushTranscriptEvents() {
+    const selected = activeSessionRef.current;
+    const events = transcriptEventQueueRef.current.splice(0);
+    if (events.length === 0) return;
+    let next =
+      transcriptRef.current && transcriptSessionIdRef.current === selected
+        ? transcriptRef.current
+        : null;
+    let nextSessionId = transcriptSessionIdRef.current;
+    let needsReconcile = false;
+    for (const event of events) {
+      if (event.sessionId !== selected) continue;
+      if (event.type === "transcript.reset") {
+        const snapshot = event.payload.snapshot as
+          | Record<string, unknown>
+          | undefined;
+        if (!snapshot) continue;
+        const page: TranscriptPage = {
+          agent_id: String(event.payload.agent_id ?? "main"),
+          items: (snapshot.items as TranscriptPage["items"]) ?? [],
+          has_more: Boolean(event.payload.has_more_older),
+          tasks: (snapshot.tasks as TranscriptPage["tasks"]) ?? [],
+          interactions: (snapshot.interactions as unknown[]) ?? [],
+          attachments:
+            (snapshot.attachments as TranscriptPage["attachments"]) ?? [],
+          todos: (snapshot.todos as TranscriptPage["todos"]) ?? [],
+          prompts: (snapshot.prompts as TranscriptPage["prompts"]) ?? [],
+          meta: (snapshot.meta as Record<string, unknown>) ?? {},
+          agents: [],
+          pending_interactions: [],
+          ...(typeof event.payload.seq === "number"
+            ? { seq: event.payload.seq }
+            : {}),
+        };
+        next = applyTranscriptReset(next, page);
+        nextSessionId = selected;
+        continue;
+      }
+      const operations = Array.isArray(event.payload.ops)
+        ? (event.payload.ops as TranscriptOperation[])
+        : [];
+      const sequence =
+        typeof event.payload.seq === "number" ? event.payload.seq : undefined;
+      const base =
+        next ?? emptyTranscript(String(event.payload.agent_id ?? "main"));
+      const result = applyTranscriptOps(base, operations, sequence);
+      next = result.state;
+      nextSessionId = selected;
+      needsReconcile ||= result.gap;
+    }
+    if (next && nextSessionId === selected) {
+      transcriptRef.current = next;
+      transcriptSessionIdRef.current = selected;
+      setTranscript(next);
+      setTranscriptSessionId(selected);
+    }
+    if (needsReconcile)
+      window.setTimeout(() => void reconcileTranscript(selected), 0);
+  }
+
   function scheduleRefresh() {
     if (refreshTimer.current !== null)
       window.clearTimeout(refreshTimer.current);
@@ -995,11 +1096,7 @@ export default function App() {
   function scheduleBrowserReconnect() {
     if (browserReconnectTimer.current !== null) return;
     reconnectAttemptRef.current += 1;
-    const ceiling = Math.min(
-      500 * 2 ** Math.max(0, reconnectAttemptRef.current - 1),
-      15_000,
-    );
-    const delay = Math.round(ceiling * (0.65 + Math.random() * 0.35));
+    const delay = relayRetryDelay(reconnectAttemptRef.current - 1);
     browserReconnectTimer.current = window.setTimeout(() => {
       browserReconnectTimer.current = null;
       setReconnectGeneration((value) => value + 1);
@@ -1020,34 +1117,25 @@ export default function App() {
     activeChannel = channelRef.current,
   ) {
     if (!activeChannel || !targetSessionId) return;
+    const refreshId = ++refreshGenerationRef.current;
+    const isCurrent = () =>
+      activeSessionRef.current === targetSessionId &&
+      refreshGenerationRef.current === refreshId &&
+      channelRef.current === activeChannel;
     try {
-      const [snapshot, transcriptResult, fileResult, gitResult] =
-        await Promise.all([
-          activeChannel.rpc<UiSessionSnapshot>("sessions.snapshot", {
+      const [snapshot, transcriptResult] = await Promise.all([
+        activeChannel.rpc<UiSessionSnapshot>("sessions.snapshot", {
+          sessionId: targetSessionId,
+        }),
+        activeChannel
+          .rpc<TranscriptPage>("sessions.transcript.read", {
             sessionId: targetSessionId,
-          }),
-          activeChannel
-            .rpc<TranscriptPage>("sessions.transcript.read", {
-              sessionId: targetSessionId,
-              agentId: "main",
-              pageSize: 20,
-            })
-            .catch(() => null),
-          activeChannel
-            .rpc<{
-              items: UiFileEntry[];
-            }>("sessions.files.search", {
-              sessionId: targetSessionId,
-              query: "",
-            })
-            .catch(() => ({ items: [] })),
-          activeChannel
-            .rpc<{
-              entries: Record<string, string>;
-            }>("sessions.files.status", { sessionId: targetSessionId })
-            .catch(() => ({ entries: {} })),
-        ]);
-      if (activeSessionRef.current !== targetSessionId) return;
+            agentId: "main",
+            pageSize: 20,
+          })
+          .catch(() => null),
+      ]);
+      if (!isCurrent()) return;
       cursorRef.current.set(targetSessionId, snapshot.asOfSeq);
       setLastSequence(snapshot.asOfSeq);
       const snapshotMessages = withInFlightMessage(
@@ -1057,14 +1145,15 @@ export default function App() {
       messagesRef.current = snapshotMessages;
       setMessages(snapshotMessages);
       if (transcriptResult) {
-        setTranscript((current) =>
-          mergeTranscriptPage(
-            current,
-            transcriptSessionId,
-            targetSessionId,
-            transcriptResult,
-          ),
+        const nextTranscript = mergeTranscriptPage(
+          transcriptRef.current,
+          transcriptSessionIdRef.current,
+          targetSessionId,
+          transcriptResult,
         );
+        transcriptRef.current = nextTranscript;
+        setTranscript(nextTranscript);
+        transcriptSessionIdRef.current = targetSessionId;
         setTranscriptSessionId(targetSessionId);
         if (transcriptResult.items.length > 0 || snapshotMessages.length === 0)
           clearTranscriptRetry();
@@ -1081,8 +1170,6 @@ export default function App() {
       setThinkingLevel(
         composerDraft?.thinkingLevel ?? snapshot.status.thinkingLevel ?? "",
       );
-      setFiles(fileResult.items ?? []);
-      setFileChanges(gitResult.entries ?? {});
       setError(null);
       setSessions((current) =>
         current.map((item) =>
@@ -1092,25 +1179,46 @@ export default function App() {
                 permissionMode: snapshot.permissionMode,
                 state: snapshot.status.busy
                   ? "running"
-                  : snapshot.pendingApprovals.length ||
-                      snapshot.pendingQuestions.length
+                  : (snapshot.pendingApprovals?.length ?? 0) ||
+                      (snapshot.pendingQuestions?.length ?? 0)
                     ? "waiting"
                     : "idle",
               }
             : item,
         ),
       );
+      void Promise.all([
+        activeChannel
+          .rpc<{ items: UiFileEntry[] }>("sessions.files.search", {
+            sessionId: targetSessionId,
+            query: "",
+          })
+          .catch(() => ({ items: [] })),
+        activeChannel
+          .rpc<{ entries: Record<string, string> }>("sessions.files.status", {
+            sessionId: targetSessionId,
+          })
+          .catch(() => ({ entries: {} })),
+      ]).then(([fileResult, gitResult]) => {
+        if (!isCurrent()) return;
+        setFiles(fileResult.items ?? []);
+        setFileChanges(gitResult.entries ?? {});
+      });
     } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "读取会话快照失败",
-      );
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "读取会话快照失败",
+        );
     }
   }
 
   async function reconcileTranscript(targetSessionId: string) {
     const activeChannel = channelRef.current;
     if (!activeChannel || !targetSessionId) return;
-    const current = transcriptSessionId === targetSessionId ? transcript : null;
+    const current =
+      transcriptSessionIdRef.current === targetSessionId
+        ? transcriptRef.current
+        : null;
     if (current?.seq) {
       try {
         const catchup = await activeChannel.rpc<{
@@ -1129,7 +1237,10 @@ export default function App() {
             if (applied.gap) throw new Error("transcript gap");
             next = applied.state;
           }
-          if (activeSessionRef.current === targetSessionId) setTranscript(next);
+          if (activeSessionRef.current === targetSessionId) {
+            transcriptRef.current = next;
+            setTranscript(next);
+          }
           clearTranscriptRetry();
           setError(null);
           return;
@@ -1148,14 +1259,15 @@ export default function App() {
         },
       );
       if (activeSessionRef.current === targetSessionId) {
-        setTranscript((current) =>
-          mergeTranscriptPage(
-            current,
-            transcriptSessionId,
-            targetSessionId,
-            page,
-          ),
+        const nextTranscript = mergeTranscriptPage(
+          transcriptRef.current,
+          transcriptSessionIdRef.current,
+          targetSessionId,
+          page,
         );
+        transcriptRef.current = nextTranscript;
+        setTranscript(nextTranscript);
+        transcriptSessionIdRef.current = targetSessionId;
         setTranscriptSessionId(targetSessionId);
         if (page.items.length > 0 || messagesRef.current.length === 0) {
           clearTranscriptRetry();
@@ -1209,11 +1321,11 @@ export default function App() {
           beforeTurn: oldest.turnId,
         },
       );
-      setTranscript((current) =>
-        current
-          ? prependTranscriptPage(current, page)
-          : transcriptFromPage(page),
-      );
+      const nextTranscript = transcriptRef.current
+        ? prependTranscriptPage(transcriptRef.current, page)
+        : transcriptFromPage(page);
+      transcriptRef.current = nextTranscript;
+      setTranscript(nextTranscript);
     } catch (nextError) {
       setError(
         nextError instanceof Error ? nextError.message : "加载更早记录失败",
@@ -1311,17 +1423,22 @@ export default function App() {
       return;
     }
     setSending(true);
+    const pendingAttachments = attachments;
+    setMessages((current) => [...current, message]);
+    setOptimisticMessage(message);
+    setPrompt("");
+    if (pendingAttachments.length > 0)
+      setAttachments((current) =>
+        current.map((item) =>
+          pendingAttachments.some((pending) => pending.id === item.id)
+            ? { id: item.id, file: item.file, status: "uploading" }
+            : item,
+        ),
+      );
     try {
       const content: Array<Record<string, unknown>> = [];
       if (text) content.push({ type: "text", text });
-      for (const attachment of attachments) {
-        setAttachments((current) =>
-          current.map((item) =>
-            item.id === attachment.id
-              ? { id: item.id, file: item.file, status: "uploading" }
-              : item,
-          ),
-        );
+      for (const attachment of pendingAttachments) {
         const uploaded = await uploadAttachment(attachment.file);
         if (attachment.file.type.startsWith("image/")) {
           content.push({
@@ -1343,9 +1460,8 @@ export default function App() {
           });
         }
       }
-      setMessages((current) => [...current, message]);
-      setPrompt("");
-      await channel?.rpc("sessions.prompt", {
+      if (!channel) throw new Error("主机通道不可用");
+      await channel.rpc("sessions.prompt", {
         sessionId: session.upstreamSessionId,
         promptId: message.id,
         content,
@@ -1359,6 +1475,7 @@ export default function App() {
       setMessages((current) =>
         current.filter((item) => item.id !== message.id),
       );
+      setOptimisticMessage(null);
       setPrompt(text);
       setAttachments((current) =>
         current.map((item) => ({
@@ -2272,19 +2389,32 @@ export default function App() {
                   <Clock3 size={14} />
                   <span>会话记录</span>
                 </div>
-                {shouldRenderTranscript(
-                  transcript,
-                  transcriptSessionId,
-                  session?.upstreamSessionId ?? "",
-                  conversationMessages.length,
-                ) ? (
-                  <TranscriptTimeline
-                    transcript={transcript!}
-                    hostId={host?.hostId ?? ""}
-                    sessionId={session?.upstreamSessionId ?? ""}
-                    onLoadOlder={() => void loadOlderTurns()}
-                    loadingOlder={loadingOlder}
-                  />
+                {transcriptVisible ? (
+                  <>
+                    <TranscriptTimeline
+                      transcript={transcript!}
+                      hostId={host?.hostId ?? ""}
+                      sessionId={session?.upstreamSessionId ?? ""}
+                      collapseCompleted={Boolean(optimisticMessage)}
+                      onLoadOlder={() => void loadOlderTurns()}
+                      loadingOlder={loadingOlder}
+                    />
+                    {optimisticMessage && (
+                      <article
+                        className="message user optimistic-message"
+                        aria-live="polite"
+                      >
+                        <div className="message-avatar">AO</div>
+                        <div className="message-content">
+                          <div className="message-meta">
+                            <strong>你</strong>
+                            <span>{messageTime(optimisticMessage.time)}</span>
+                          </div>
+                          <MarkdownMessage text={optimisticMessage.text} />
+                        </div>
+                      </article>
+                    )}
+                  </>
                 ) : (
                   conversationMessages.map((message) => (
                     <article
@@ -2529,9 +2659,11 @@ export default function App() {
                   placeholder={
                     host?.state !== "online"
                       ? "主机不可用"
-                      : `向 ${host?.displayName ?? "所选主机"} 上的 Kimi 发送消息`
+                      : !channel
+                        ? "等待代理启动"
+                        : `向 ${host?.displayName ?? "所选主机"} 上的 Kimi 发送消息`
                   }
-                  disabled={host?.state !== "online"}
+                  disabled={host?.state !== "online" || !channel}
                   rows={2}
                 />
                 <div className="composer-footer">
@@ -2649,6 +2781,7 @@ export default function App() {
                     disabled={
                       (!prompt.trim() && attachments.length === 0) ||
                       host?.state !== "online" ||
+                      !channel ||
                       sending
                     }
                     aria-label="发送消息"

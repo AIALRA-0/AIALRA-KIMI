@@ -147,6 +147,16 @@ export interface TranscriptState {
   seq: number;
 }
 
+export function turnTraceDefaultOpen(
+  state: TranscriptTurnState,
+  latest: boolean,
+  collapseCompleted = false,
+): boolean {
+  return (
+    state === "running" || state === "queued" || (latest && !collapseCompleted)
+  );
+}
+
 export type TranscriptOperation = Record<string, unknown> & { op: string };
 
 export function emptyTranscript(agentId = "main"): TranscriptState {

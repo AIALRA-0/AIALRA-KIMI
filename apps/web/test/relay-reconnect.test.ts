@@ -68,17 +68,21 @@ class MockWebSocket {
 describe("browser relay recovery", () => {
   beforeEach(() => {
     MockWebSocket.instances = [];
+    vi.clearAllMocks();
     vi.stubGlobal("WebSocket", MockWebSocket);
   });
 
-  it("waits for the authenticated relay-ready message before opening a channel", async () => {
+  it("waits for relay-ready and retries with a fresh grant after a cold start", async () => {
     const { BrowserRelay } = await import("../src/relay.js");
+    const { api } = await import("../src/api.js");
     const relay = new BrowserRelay();
+    const controller = new AbortController();
     const attempt = relay.open(
       "host_windows",
       "kimi",
       ["sessions.list"],
       vi.fn(),
+      controller.signal,
     );
     const socket = MockWebSocket.instances[0]!;
 
@@ -96,35 +100,6 @@ describe("browser relay recovery", () => {
       requestId: request.requestId,
       code: "host_offline",
     });
-    await expect(attempt).rejects.toThrow("主机已离线");
-    expect(socket.sent.at(-1)?.type).toBe("browser.channel.close");
-  });
-
-  it("discards a cold-start channel and allows an automatic retry", async () => {
-    const { BrowserRelay } = await import("../src/relay.js");
-    const relay = new BrowserRelay();
-    const disconnected = vi.fn();
-    const firstAttempt = relay.open(
-      "host_windows",
-      "kimi",
-      ["sessions.list"],
-      disconnected,
-    );
-    const socket = MockWebSocket.instances[0]!;
-    socket.open();
-    socket.message({ type: "server.browser.ready" });
-    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
-
-    socket.message({ type: "server.host.offline", hostId: "host_windows" });
-    await expect(firstAttempt).rejects.toThrow("主机已离线");
-    expect(disconnected).toHaveBeenCalledWith({ type: "channel.disconnected" });
-
-    const secondAttempt = relay.open(
-      "host_windows",
-      "kimi",
-      ["sessions.list"],
-      vi.fn(),
-    );
     await vi.waitFor(() =>
       expect(
         socket.sent.filter(
@@ -132,15 +107,48 @@ describe("browser relay recovery", () => {
         ),
       ).toHaveLength(2),
     );
-    const secondOpen = socket.sent.findLast(
+    const retry = socket.sent.findLast(
       (message) => message.type === "browser.channel.open",
     )!;
-    socket.message({
-      type: "server.error",
-      requestId: secondOpen.requestId,
-      code: "host_offline",
-    });
-    await expect(secondAttempt).rejects.toThrow("主机已离线");
+    expect(retry.channelId).not.toBe(request.channelId);
+    expect(api.grant).toHaveBeenCalledTimes(2);
+    controller.abort();
+    await expect(attempt).rejects.toThrow("中继连接已取消");
+  });
+
+  it("wakes a pending retry when the selected host comes online", async () => {
+    const { BrowserRelay } = await import("../src/relay.js");
+    const relay = new BrowserRelay();
+    const disconnected = vi.fn();
+    const controller = new AbortController();
+    const firstAttempt = relay.open(
+      "host_windows",
+      "kimi",
+      ["sessions.list"],
+      disconnected,
+      controller.signal,
+    );
+    const socket = MockWebSocket.instances[0]!;
+    socket.open();
+    socket.message({ type: "server.browser.ready" });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+
+    socket.message({ type: "server.host.offline", hostId: "host_windows" });
+    expect(disconnected).toHaveBeenCalledWith({ type: "channel.disconnected" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(
+      socket.sent.filter((message) => message.type === "browser.channel.open"),
+    ).toHaveLength(1);
+    socket.message({ type: "server.host.online", hostId: "host_windows" });
+    await vi.waitFor(() =>
+      expect(
+        socket.sent.filter(
+          (message) => message.type === "browser.channel.open",
+        ),
+      ).toHaveLength(2),
+    );
+    controller.abort();
+    await expect(firstAttempt).rejects.toThrow("中继连接已取消");
   });
 
   it("bounds transcript recovery retries with jitter", async () => {
@@ -149,5 +157,13 @@ describe("browser relay recovery", () => {
     expect(transcriptRetryDelay(0, () => 1)).toBe(500);
     expect(transcriptRetryDelay(20, () => 0)).toBe(9_750);
     expect(transcriptRetryDelay(20, () => 1)).toBe(15_000);
+  });
+
+  it("uses an eager bounded relay backoff", async () => {
+    const { relayRetryDelay } = await import("../src/recovery-policy.js");
+    expect(relayRetryDelay(0, () => 0)).toBe(188);
+    expect(relayRetryDelay(0, () => 1)).toBe(250);
+    expect(relayRetryDelay(20, () => 0)).toBe(11_250);
+    expect(relayRetryDelay(20, () => 1)).toBe(15_000);
   });
 });

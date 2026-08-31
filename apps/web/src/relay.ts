@@ -8,6 +8,7 @@ import type {
   EncryptedChannelFrame,
 } from "@aialra-kimi/protocol";
 import { api, csrfToken } from "./api.js";
+import { relayRetryDelay } from "./recovery-policy.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -73,18 +74,48 @@ export class BrowserRelay {
   private socket: WebSocket | null = null;
   private socketReady: Promise<void> | null = null;
   private readonly channels = new Map<string, ChannelState>();
+  private readonly hostOnlineWaiters = new Map<string, Set<() => void>>();
 
   async open(
     hostId: string,
     channel: ChannelState["channel"],
     scopes: AgentOperation[],
     onEvent: (event: unknown) => void,
+    signal?: AbortSignal,
   ): Promise<RelayChannel> {
-    await this.connect();
-    const [{ token }, identity] = await Promise.all([
-      api.grant(hostId, scopes),
-      api.identity(hostId),
-    ]);
+    let attempt = 0;
+    for (;;) {
+      throwIfAborted(signal);
+      try {
+        const state = await this.openAttempt(
+          hostId,
+          channel,
+          scopes,
+          onEvent,
+          signal,
+        );
+        return new RelayChannel(this, state);
+      } catch (error) {
+        if (isAbortError(error) || signal?.aborted) throw abortError();
+        if (!isRetryableOpenError(error)) throw error;
+        await this.waitForRetry(hostId, attempt, signal);
+        attempt += 1;
+      }
+    }
+  }
+
+  private async openAttempt(
+    hostId: string,
+    channel: ChannelState["channel"],
+    scopes: AgentOperation[],
+    onEvent: (event: unknown) => void,
+    signal?: AbortSignal,
+  ): Promise<ChannelState> {
+    await abortable(this.connect(), signal);
+    const [{ token }, identity] = await abortable(
+      Promise.all([api.grant(hostId, scopes), api.identity(hostId)]),
+      signal,
+    );
     const privateKey = x25519.utils.randomSecretKey();
     const publicKey = x25519.getPublicKey(privateKey);
     const channelId = crypto.randomUUID();
@@ -114,6 +145,7 @@ export class BrowserRelay {
     };
     this.channels.set(channelId, state);
     try {
+      throwIfAborted(signal);
       this.send({
         type: "browser.channel.open",
         requestId: openRequestId,
@@ -123,8 +155,8 @@ export class BrowserRelay {
         browserEphemeralKey: state.browserPublicKey,
         grant: token,
       });
-      await this.waitUntilReady(state);
-      return new RelayChannel(this, state);
+      await this.waitUntilReady(state, signal);
+      return state;
     } catch (error) {
       this.discardChannel(
         state,
@@ -257,6 +289,10 @@ export class BrowserRelay {
       }
       return;
     }
+    if (message.type === "server.host.online") {
+      this.wakeHost(String(message.hostId));
+      return;
+    }
     if (message.type === "agent.channel.accept") {
       const channel = this.channels.get(String(message.channelId));
       if (!channel) return;
@@ -347,21 +383,71 @@ export class BrowserRelay {
     }
   }
 
-  private async waitUntilReady(state: ChannelState): Promise<void> {
+  private async waitUntilReady(
+    state: ChannelState,
+    signal?: AbortSignal,
+  ): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | null = null;
     try {
-      await Promise.race([
-        state.ready,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error("代理通道连接超时")),
-            10_000,
-          );
-        }),
-      ]);
+      await abortable(
+        Promise.race([
+          state.ready,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("代理通道连接超时")),
+              10_000,
+            );
+          }),
+        ]),
+        signal,
+      );
     } finally {
       if (timer !== null) clearTimeout(timer);
     }
+  }
+
+  private waitForRetry(
+    hostId: string,
+    attempt: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const delay = relayRetryDelay(attempt);
+    return new Promise<void>((resolve, reject) => {
+      const waiters = this.hostOnlineWaiters.get(hostId) ?? new Set();
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const wake = () => settleResolve();
+      const cleanup = () => {
+        if (timer !== null) clearTimeout(timer);
+        timer = null;
+        waiters.delete(wake);
+        if (waiters.size === 0) this.hostOnlineWaiters.delete(hostId);
+        signal?.removeEventListener("abort", abort);
+      };
+      const settleResolve = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const settleReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const abort = () => settleReject(abortError());
+      waiters.add(wake);
+      this.hostOnlineWaiters.set(hostId, waiters);
+      signal?.addEventListener("abort", abort, { once: true });
+      timer = setTimeout(settleResolve, delay);
+    });
+  }
+
+  private wakeHost(hostId: string): void {
+    const waiters = this.hostOnlineWaiters.get(hostId);
+    if (!waiters) return;
+    for (const wake of [...waiters]) wake();
   }
 
   private discardChannel(
@@ -384,6 +470,56 @@ export class BrowserRelay {
       );
     }
   }
+}
+
+function abortError(): Error {
+  return new Error("中继连接已取消");
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.message === "中继连接已取消";
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(abortError());
+    signal.addEventListener("abort", abort, { once: true });
+    promise
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+function isRetryableOpenError(error: unknown): boolean {
+  if (isApiError(error)) {
+    return (
+      error.status >= 500 ||
+      ["host_offline", "host_degraded", "host_unsupported"].includes(error.code)
+    );
+  }
+  if (!(error instanceof Error)) return true;
+  return ![
+    "代理通道签名无效",
+    "通道密钥不可用",
+    "授权已失效",
+    "登录已失效",
+    "当前账号不属于所有者组",
+  ].some((marker) => error.message.includes(marker));
+}
+
+function isApiError(error: unknown): error is { status: number; code: string } {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      typeof (error as { status?: unknown }).status === "number" &&
+      typeof (error as { code?: unknown }).code === "string",
+  );
 }
 
 export class RelayChannel {

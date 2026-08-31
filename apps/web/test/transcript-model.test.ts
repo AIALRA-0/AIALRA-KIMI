@@ -5,6 +5,7 @@ import {
   mergeTranscriptPage,
   shouldRenderTranscript,
   transcriptFromPage,
+  turnTraceDefaultOpen,
   type TranscriptPage,
 } from "../src/transcript-model.js";
 
@@ -57,6 +58,13 @@ function page(): TranscriptPage {
 }
 
 describe("transcript v2 reducer", () => {
+  it("keeps running traces open and folds completed traces when a new prompt starts", () => {
+    expect(turnTraceDefaultOpen("running", true, true)).toBe(true);
+    expect(turnTraceDefaultOpen("completed", true, false)).toBe(true);
+    expect(turnTraceDefaultOpen("completed", true, true)).toBe(false);
+    expect(turnTraceDefaultOpen("completed", false, false)).toBe(false);
+  });
+
   it("applies exact-offset deltas and rejects duplicates", () => {
     const state = transcriptFromPage(page());
     const operation = {

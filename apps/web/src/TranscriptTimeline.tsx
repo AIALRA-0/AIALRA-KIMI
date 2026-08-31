@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { MarkdownMessage } from "./MessageBody.js";
+import { turnTraceDefaultOpen } from "./transcript-model.js";
 import type {
   TranscriptFrame,
   TranscriptState,
@@ -24,6 +25,7 @@ interface TranscriptTimelineProps {
   transcript: TranscriptState;
   hostId: string;
   sessionId: string;
+  collapseCompleted?: boolean;
   onLoadOlder?: () => void;
   loadingOlder?: boolean;
 }
@@ -91,11 +93,17 @@ function stateLabel(state: TranscriptTurn["state"]): string {
   return "已完成";
 }
 
-function TraceFrame({ frame }: { frame: TranscriptFrame }) {
+function TraceFrame({
+  frame,
+  turnRunning,
+}: {
+  frame: TranscriptFrame;
+  turnRunning: boolean;
+}) {
   if (frame.kind === "text" && frame.role === "assistant") return null;
   if (frame.kind === "thinking") {
     return (
-      <details className="trace-part thinking-part" open={false}>
+      <details className="trace-part thinking-part" open={turnRunning}>
         <summary>
           <ChevronRight size={14} />
           <Brain size={14} />
@@ -219,7 +227,11 @@ function StepTrace({ step }: { step: TranscriptStep }) {
         </details>
       )}
       {frames.map((frame) => (
-        <TraceFrame key={frame.frameId} frame={frame} />
+        <TraceFrame
+          key={frame.frameId}
+          frame={frame}
+          turnRunning={step.state === "running"}
+        />
       ))}
     </div>
   );
@@ -228,14 +240,20 @@ function StepTrace({ step }: { step: TranscriptStep }) {
 function TurnCard({
   turn,
   latest,
+  collapseCompleted,
   storageKey,
 }: {
   turn: TranscriptTurn;
   latest: boolean;
+  collapseCompleted: boolean;
   storageKey: string;
 }) {
   const running = turn.state === "running" || turn.state === "queued";
-  const defaultOpen = running || latest;
+  const defaultOpen = turnTraceDefaultOpen(
+    turn.state,
+    latest,
+    collapseCompleted,
+  );
   const [manual, setManual] = useState<boolean | null>(() => {
     const value = sessionStorage.getItem(storageKey);
     return value === "open" ? true : value === "closed" ? false : null;
@@ -329,6 +347,7 @@ export function TranscriptTimeline({
   transcript,
   hostId,
   sessionId,
+  collapseCompleted = false,
   onLoadOlder,
   loadingOlder,
 }: TranscriptTimelineProps) {
@@ -355,6 +374,7 @@ export function TranscriptTimeline({
           key={turn.turnId}
           turn={turn}
           latest={index === turns.length - 1}
+          collapseCompleted={collapseCompleted}
           storageKey={`aialra-fold:${hostId}:${sessionId}:${turn.turnId}`}
         />
       ))}
