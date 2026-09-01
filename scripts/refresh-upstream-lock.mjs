@@ -173,7 +173,6 @@ try {
 const current = JSON.parse(await readFile(lockPath, "utf8"));
 const updated = {
   ...current,
-  capturedAt: new Date().toISOString(),
   version,
   tag,
   commit,
@@ -189,5 +188,14 @@ const updated = {
     status: "experimental",
   },
 };
-await writeFile(lockPath, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
-console.log(`Updated upstream.lock.json to Kimi ${version} at ${commit}`);
+const currentRelease = { ...current };
+const updatedRelease = { ...updated };
+delete currentRelease.capturedAt;
+delete updatedRelease.capturedAt;
+if (JSON.stringify(currentRelease) === JSON.stringify(updatedRelease)) {
+  console.log(`Kimi ${version} remains the pinned upstream release`);
+} else {
+  updated.capturedAt = new Date().toISOString();
+  await writeFile(lockPath, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
+  console.log(`Updated upstream.lock.json to Kimi ${version} at ${commit}`);
+}

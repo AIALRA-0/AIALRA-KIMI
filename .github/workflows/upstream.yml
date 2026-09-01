@@ -6,8 +6,7 @@ on:
     - cron: "17 9 * * 2"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   candidate:
@@ -26,14 +25,20 @@ jobs:
         run: pnpm refresh:upstream
       - run: pnpm check
       - run: pnpm build
-      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
-        with:
-          branch: automation/kimi-upstream-candidate
-          delete-branch: true
-          commit-message: "chore: refresh the pinned Kimi candidate"
-          title: "chore: validate the latest Kimi Code candidate"
-          body: |
-            This automated candidate records the upstream tag, commit, release checksums, and live OpenAPI and AsyncAPI hashes
+      - name: Report a real upstream candidate
+        run: |
+          if git diff --quiet -- upstream.lock.json; then
+            echo "Kimi upstream remains pinned without changes"
+            exit 0
+          fi
 
-            Production promotion remains manual and requires the repository contract, browser, security, and deployment gates
-          labels: upstream-candidate
+          {
+            echo "## Kimi upstream candidate detected"
+            echo
+            echo "The pinned release or protocol changed. Review and promote it directly through main."
+            echo
+            git diff --stat -- upstream.lock.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          git diff -- upstream.lock.json
+          echo "::error::A real Kimi upstream candidate requires manual review and direct main promotion"
+          exit 1
