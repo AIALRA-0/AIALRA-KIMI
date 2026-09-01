@@ -7,12 +7,14 @@ import {
   Gauge,
   GitBranch,
   Laptop,
+  LoaderCircle,
   Menu,
   MessageSquare,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
+  PanelRightOpen,
   Paperclip,
   Pencil,
   Pin,
@@ -37,6 +39,7 @@ import type {
   UsageSnapshot,
 } from "@aialra-kimi/protocol";
 import { ActivityPanel } from "./ActivityPanel.js";
+import { ArchiveManager } from "./ArchiveManager.js";
 import { ApiError, api } from "./api.js";
 import {
   BUILTIN_COMMANDS,
@@ -65,9 +68,13 @@ import {
   type KimiOAuthRegion,
   type OAuthFlow,
 } from "./KimiOAuthPanel.js";
-import { MarkdownMessage, ToolMessage } from "./MessageBody.js";
+import { CopyButton, MarkdownMessage, ToolMessage } from "./MessageBody.js";
 import { supportedEfforts } from "./model-options.js";
-import { NewSessionDialog, type NewSessionInput } from "./NewSessionDialog.js";
+import {
+  NewSessionDialog,
+  type NewSessionInput,
+  type WorkspaceOption,
+} from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
 import { relayRetryDelay, transcriptRetryDelay } from "./recovery-policy.js";
 import { BrowserRelay, type RelayChannel } from "./relay.js";
@@ -102,7 +109,27 @@ import {
   type KimiEventEnvelope,
 } from "./session-model.js";
 
-type MainView = "conversation" | "terminal" | "account" | "settings";
+type MainView =
+  | "conversation"
+  | "terminal"
+  | "account"
+  | "settings"
+  | "archive";
+
+type LoadPhase =
+  | "loading"
+  | "ready"
+  | "empty"
+  | "offline"
+  | "reconnecting"
+  | "error";
+type TerminalPhase = Exclude<LoadPhase, "empty">;
+type PromptActionState =
+  | "idle"
+  | "applying"
+  | "pending-confirmation"
+  | "confirmed"
+  | "failed";
 
 interface PendingAttachment {
   id: string;
@@ -124,6 +151,7 @@ const kimiScopes = [
   "sessions.create",
   "sessions.read",
   "sessions.archive",
+  "sessions.restore",
   "sessions.fork",
   "sessions.prompt",
   "sessions.interrupt",
@@ -131,6 +159,7 @@ const kimiScopes = [
   "sessions.events",
   "sessions.transcript.read",
   "sessions.transcript.resume",
+  "sessions.transcript.subscribe",
   "sessions.messages.page",
   "sessions.prompts.list",
   "sessions.prompts.steer",
@@ -158,6 +187,8 @@ const kimiScopes = [
   "sessions.files.status",
   "sessions.permission.read",
   "sessions.permission.write",
+  "workspaces.list",
+  "workspaces.ensure",
   "oauth.userinfo",
   "oauth.usage",
   "oauth.device.start",
@@ -211,6 +242,28 @@ function hostIcon(host: HostDescriptor) {
   return host.mode === "vps" ? Server : Laptop;
 }
 
+const capabilityDescriptions: Record<string, string> = {
+  websocket: "通过加密 WebSocket 接收实时会话事件",
+  transcript_v2: "支持按序号恢复完整对话时间线",
+  elevation: "支持一次性管理员终端，需要重新验证",
+  terminal: "支持普通终端输入、输出和调整尺寸",
+  attachments: "支持文件、图片和视频附件",
+  archive: "支持归档和恢复会话",
+};
+
+function capabilityLabel(value: string): string {
+  return (
+    {
+      websocket: "实时通道",
+      transcript_v2: "对话恢复",
+      elevation: "管理员终端",
+      terminal: "普通终端",
+      attachments: "附件",
+      archive: "归档恢复",
+    }[value] ?? value
+  );
+}
+
 function preferredHostId(hosts: HostDescriptor[], current: string): string {
   if (hosts.some((host) => host.hostId === current)) return current;
   const saved = localStorage.getItem("aialra-selected-host");
@@ -254,10 +307,18 @@ export default function App() {
     new URLSearchParams(location.search).get("demo") === "1";
   const [theme, setTheme] = usePreferredTheme();
   const [hosts, setHosts] = useState<HostDescriptor[]>(demo ? demoHosts : []);
+  const [hostsPhase, setHostsPhase] = useState<LoadPhase>(
+    demo ? "ready" : "loading",
+  );
   const [hostId, setHostId] = useState(demo ? demoHosts[0]!.hostId : "");
   const [sessions, setSessions] = useState<UiSession[]>(
     demo ? demoSessions : [],
   );
+  const [sessionsPhase, setSessionsPhase] = useState<LoadPhase>(
+    demo ? "ready" : "loading",
+  );
+  const [archivedSessions, setArchivedSessions] = useState<UiSession[]>([]);
+  const [archiveLoading, setArchiveLoading] = useState(false);
   const [sessionId, setSessionId] = useState(
     demo ? demoSessions[0]!.upstreamSessionId : "",
   );
@@ -326,11 +387,17 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => localStorage.getItem("aialra-sidebar-collapsed") === "1",
   );
-  const [rightPanel, setRightPanel] = useState(true);
+  const [rightPanel, setRightPanel] = useState(() =>
+    typeof window === "undefined" ? true : window.innerWidth > 1120,
+  );
   const [elevated, setElevated] = useState(false);
   const [authRequired, setAuthRequired] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [workspaceOptions, setWorkspaceOptions] = useState<WorkspaceOption[]>(
+    [],
+  );
+  const [workspaceMissing, setWorkspaceMissing] = useState(false);
   const [renameTarget, setRenameTarget] = useState<UiSession | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
   const [pairingOpen, setPairingOpen] = useState(false);
@@ -342,9 +409,16 @@ export default function App() {
     useState<PermissionMode>("manual");
   const [reconnectGeneration, setReconnectGeneration] = useState(0);
   const [terminalGeneration, setTerminalGeneration] = useState(0);
+  const [terminalPhase, setTerminalPhase] = useState<TerminalPhase>(
+    demo ? "ready" : "loading",
+  );
   const composer = useRef<HTMLTextAreaElement>(null);
   const attachmentInput = useRef<HTMLInputElement>(null);
   const channelRef = useRef<RelayChannel | null>(null);
+  const hostsRef = useRef(hosts);
+  const hostGenerationRef = useRef(0);
+  const sessionsByHostRef = useRef(new Map<string, UiSession[]>());
+  const sessionSelectionByHostRef = useRef(new Map<string, string>());
   const activeSessionRef = useRef(sessionId);
   const messagesRef = useRef(messages);
   const transcriptRef = useRef<TranscriptState | null>(transcript);
@@ -361,17 +435,38 @@ export default function App() {
   const browserReconnectTimer = useRef<number | null>(null);
   const transcriptRetryAttemptRef = useRef(0);
   const transcriptRetryTimer = useRef<number | null>(null);
+  const sendRequestRef = useRef(0);
   const composerDraftRef = useRef(
     new Map<string, { model: string; thinkingLevel: string }>(),
   );
   const [pinnedSessionIds, setPinnedSessionIds] =
     useState<Set<string>>(loadPinnedSessions);
+  const [archiveQuery, setArchiveQuery] = useState("");
+  const pendingWorkspaceSessionRef = useRef<NewSessionInput | null>(null);
+  const [promptActions, setPromptActions] = useState<
+    Record<string, PromptActionState>
+  >({});
+  const promptActionLocksRef = useRef(new Set<string>());
+  const retryPromptRef = useRef<{
+    sessionId: string;
+    promptId: string;
+    text: string;
+    attachmentIds: string[];
+  } | null>(null);
+  const [autoCollapsedTurnIds, setAutoCollapsedTurnIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const conversationScrollRef = useRef<HTMLDivElement | null>(null);
+  const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
+  const followBottomRef = useRef(true);
+  const [followingBottom, setFollowingBottom] = useState(true);
+  const [unreadWhileScrolled, setUnreadWhileScrolled] = useState(0);
+  const scrollFrameRef = useRef<number | null>(null);
 
-  const host =
-    hosts.find((candidate) => candidate.hostId === hostId) ?? hosts[0];
-  const session =
-    sessions.find((candidate) => candidate.upstreamSessionId === sessionId) ??
-    sessions[0];
+  const host = hosts.find((candidate) => candidate.hostId === hostId);
+  const session = sessions.find(
+    (candidate) => candidate.upstreamSessionId === sessionId,
+  );
   const filteredSessions = useMemo(
     () =>
       sessions.filter((item) =>
@@ -424,14 +519,30 @@ export default function App() {
     session?.upstreamSessionId ?? "",
     conversationMessages.length,
   );
+  const canUseComposerAttachments = Boolean(
+    session && (demo || (host?.state === "online" && channel)),
+  );
 
   useEffect(() => {
     activeSessionRef.current = sessionId;
-  }, [sessionId]);
+    if (hostId) sessionSelectionByHostRef.current.set(hostId, sessionId);
+  }, [hostId, sessionId]);
+
+  useEffect(() => {
+    hostsRef.current = hosts;
+    for (const host of hosts) {
+      if (!sessionsByHostRef.current.has(host.hostId))
+        sessionsByHostRef.current.set(host.hostId, []);
+    }
+  }, [hosts]);
 
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    if (hostId) sessionsByHostRef.current.set(hostId, sessions);
+  }, [hostId, sessions]);
 
   useEffect(() => {
     transcriptRef.current = transcript;
@@ -440,6 +551,151 @@ export default function App() {
   useEffect(() => {
     transcriptSessionIdRef.current = transcriptSessionId;
   }, [transcriptSessionId]);
+
+  useEffect(() => {
+    if (demo || !channel || !host || !newSessionOpen) return;
+    let active = true;
+    const storageKey = `aialra-workspaces:${host.hostId}`;
+    let recent: WorkspaceOption[] = [];
+    try {
+      const parsed = JSON.parse(localStorage.getItem(storageKey) ?? "[]");
+      if (Array.isArray(parsed)) {
+        recent = parsed.filter((item): item is WorkspaceOption =>
+          Boolean(
+            item &&
+              typeof item.root === "string" &&
+              typeof item.name === "string",
+          ),
+        );
+      }
+    } catch {
+      recent = [];
+    }
+    setWorkspaceOptions(recent);
+    void channel
+      .rpc<{ items?: Array<Record<string, unknown>> }>("workspaces.list")
+      .then((result) => {
+        if (!active) return;
+        const remote = (result.items ?? []).flatMap((item) => {
+          const root =
+            typeof item.root === "string"
+              ? item.root
+              : typeof item.path === "string"
+                ? item.path
+                : "";
+          if (!root) return [];
+          const name =
+            typeof item.name === "string" && item.name.trim()
+              ? item.name
+              : (root.split(/[\\/]/u).filter(Boolean).at(-1) ?? root);
+          return [{ root, name }];
+        });
+        const merged = [...remote, ...recent].filter(
+          (item, index, items) =>
+            items.findIndex((candidate) => candidate.root === item.root) ===
+            index,
+        );
+        setWorkspaceOptions(merged.slice(0, 20));
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [channel, demo, host?.hostId, newSessionOpen]);
+
+  useEffect(() => {
+    if (!newSessionOpen) {
+      setWorkspaceMissing(false);
+      pendingWorkspaceSessionRef.current = null;
+    }
+  }, [newSessionOpen]);
+
+  useEffect(() => {
+    const container = conversationScrollRef.current;
+    if (!container || view !== "conversation") return;
+    if (scrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(scrollFrameRef.current);
+      scrollFrameRef.current = null;
+    }
+    const scrollToBottom = () => {
+      scrollFrameRef.current = null;
+      if (!followBottomRef.current) {
+        setUnreadWhileScrolled((count) => count + 1);
+        return;
+      }
+      container.scrollTop = container.scrollHeight;
+      bottomAnchorRef.current?.scrollIntoView({ block: "end" });
+      setUnreadWhileScrolled(0);
+    };
+    scrollFrameRef.current = window.requestAnimationFrame(scrollToBottom);
+    return () => {
+      if (scrollFrameRef.current === null) return;
+      window.cancelAnimationFrame(scrollFrameRef.current);
+      scrollFrameRef.current = null;
+    };
+  }, [
+    conversationMessages,
+    optimisticMessage,
+    transcript,
+    transcriptVisible,
+    view,
+  ]);
+
+  useEffect(() => {
+    followBottomRef.current = true;
+    setFollowingBottom(true);
+    setUnreadWhileScrolled(0);
+    setPromptActions({});
+    promptActionLocksRef.current.clear();
+    setAutoCollapsedTurnIds(new Set());
+    // A draft belongs to the selected session.  Clear it when the user
+    // deliberately changes sessions, while reconnects for the same session
+    // leave the draft and attachments untouched.
+    sendRequestRef.current += 1;
+    setSending(false);
+    setActionBusy(false);
+    setOptimisticMessage(null);
+    setPrompt("");
+    setAttachments([]);
+  }, [hostId, sessionId]);
+
+  function markCompletedTurnsCollapsed() {
+    const current = transcriptRef.current;
+    if (!current) return;
+    const completed = current.items.flatMap((item) =>
+      item.kind === "turn" &&
+      item.state !== "running" &&
+      item.state !== "queued"
+        ? [item.turnId]
+        : [],
+    );
+    if (!completed.length) return;
+    setAutoCollapsedTurnIds((existing) => {
+      const next = new Set(existing);
+      for (const turnId of completed) next.add(turnId);
+      return next;
+    });
+  }
+
+  function handleConversationScroll() {
+    const container = conversationScrollRef.current;
+    if (!container) return;
+    const distance =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+    const nextFollowing = distance <= 64;
+    followBottomRef.current = nextFollowing;
+    setFollowingBottom(nextFollowing);
+    if (nextFollowing) setUnreadWhileScrolled(0);
+  }
+
+  function returnToConversationBottom() {
+    const container = conversationScrollRef.current;
+    if (!container) return;
+    followBottomRef.current = true;
+    setFollowingBottom(true);
+    setUnreadWhileScrolled(0);
+    container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
+  }
 
   useEffect(() => {
     if (!optimisticMessage || !transcript) return;
@@ -487,6 +743,47 @@ export default function App() {
   }, [demo]);
 
   useEffect(() => {
+    if (!authRequired || demo) return;
+    const current = `${location.pathname}${location.search}${location.hash}`;
+    location.replace(`/auth/login?returnTo=${encodeURIComponent(current)}`);
+  }, [authRequired, demo]);
+
+  useEffect(() => {
+    if (demo || !host) return;
+    const shouldPoll =
+      host.state === "offline" ||
+      host.state === "degraded" ||
+      sessionsPhase === "reconnecting";
+    if (!shouldPoll) return;
+    let active = true;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const nextHosts = await api.hosts();
+        if (!active) return;
+        setHosts(nextHosts);
+        setHostsPhase(nextHosts.length ? "ready" : "empty");
+        if (nextHosts.some((item) => item.hostId === host.hostId))
+          setStatus((current) =>
+            current === "离线元数据" || current === "状态异常 · 正在重连"
+              ? "等待代理启动"
+              : current,
+          );
+      } catch (nextError) {
+        if (active && nextError instanceof ApiError && nextError.status === 401)
+          setAuthRequired(true);
+      } finally {
+        if (active) timer = window.setTimeout(() => void poll(), 5_000);
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [demo, host?.hostId, host?.state, sessionsPhase]);
+
+  useEffect(() => {
     if (host && elevated && !demo && !host.capabilities.includes("elevation")) {
       setElevated(false);
       setError("所选主机没有可用的提权终端代理");
@@ -522,10 +819,13 @@ export default function App() {
     let active = true;
     async function loadHosts() {
       try {
+        if (!hostsRef.current.length) setHostsPhase("loading");
         await api.me();
         const nextHosts = await api.hosts();
         if (!active) return;
         setHosts(nextHosts);
+        setHostsPhase(nextHosts.length ? "ready" : "empty");
+        if (!nextHosts.length) setSessionsPhase("empty");
         setHostId((current) => preferredHostId(nextHosts, current));
         setStatus(
           nextHosts.length
@@ -535,6 +835,8 @@ export default function App() {
             : "尚未配对主机",
         );
       } catch (nextError) {
+        if (active)
+          setHostsPhase(hostsRef.current.length ? "reconnecting" : "error");
         if (nextError instanceof ApiError && nextError.status === 401)
           setAuthRequired(true);
         else
@@ -553,6 +855,7 @@ export default function App() {
 
   useEffect(() => {
     if (demo || !host) return;
+    const generation = ++hostGenerationRef.current;
     let disposed = false;
     let opened: RelayChannel | null = null;
     const abortController = new AbortController();
@@ -561,9 +864,21 @@ export default function App() {
     channelRef.current?.close();
     channelRef.current = null;
     setChannel(null);
+    setActionBusy(false);
     if (changingHost) {
-      setSessions([]);
-      setSessionId("");
+      const cachedSessions = sessionsByHostRef.current.get(host.hostId) ?? [];
+      const cachedSelection = sessionSelectionByHostRef.current.get(
+        host.hostId,
+      );
+      setSessions(cachedSessions);
+      setSessionId(
+        cachedSelection &&
+          cachedSessions.some(
+            (item) => item.upstreamSessionId === cachedSelection,
+          )
+          ? cachedSelection
+          : (cachedSessions[0]?.upstreamSessionId ?? ""),
+      );
       setMessages([]);
       setOptimisticMessage(null);
       transcriptRef.current = null;
@@ -579,8 +894,11 @@ export default function App() {
       setUsage(null);
       setOauthFlow(null);
       setError(null);
+      setPrompt("");
+      setAttachments([]);
       reconnectAttemptRef.current = 0;
     }
+    setSessionsPhase(changingHost ? "loading" : "reconnecting");
     oauthHostRef.current = null;
     if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
     setStatus("等待代理启动");
@@ -588,11 +906,37 @@ export default function App() {
       try {
         if (host.state === "offline" || host.state === "unsupported") {
           const cached = await api.sessionCache(host.hostId);
-          if (!disposed) {
-            setSessions(
-              cached.map((item) => ({ ...item, permissionMode: "manual" })),
+          if (!disposed && hostGenerationRef.current === generation) {
+            const cachedSessions = cached.map((item) => ({
+              ...item,
+              permissionMode: "manual" as PermissionMode,
+            }));
+            const previousSessions =
+              sessionsByHostRef.current.get(host.hostId) ?? [];
+            const merged = [
+              ...previousSessions,
+              ...cachedSessions.filter(
+                (item) =>
+                  !previousSessions.some(
+                    (candidate) =>
+                      candidate.upstreamSessionId === item.upstreamSessionId,
+                  ),
+              ),
+            ];
+            sessionsByHostRef.current.set(host.hostId, merged);
+            setSessions(merged);
+            const previousSelection = sessionSelectionByHostRef.current.get(
+              host.hostId,
             );
-            setSessionId(cached[0]?.upstreamSessionId ?? "");
+            const nextSelection =
+              previousSelection &&
+              merged.some(
+                (item) => item.upstreamSessionId === previousSelection,
+              )
+                ? previousSelection
+                : (merged[0]?.upstreamSessionId ?? "");
+            setSessionId(nextSelection);
+            setSessionsPhase(host.state === "offline" ? "offline" : "error");
             setStatus(
               host.state === "offline" ? "离线元数据" : "不支持的 Kimi 版本",
             );
@@ -606,17 +950,34 @@ export default function App() {
           handleAgentEvent,
           abortController.signal,
         );
-        if (disposed || abortController.signal.aborted) return opened.close();
+        if (
+          disposed ||
+          abortController.signal.aborted ||
+          hostGenerationRef.current !== generation
+        )
+          return opened.close();
         channelRef.current = opened;
         setChannel(opened);
+        setHosts((current) =>
+          current.map((item) =>
+            item.hostId === host.hostId ? { ...item, state: "online" } : item,
+          ),
+        );
         setError(null);
         setStatus("在线 · 端到端加密");
         reconnectAttemptRef.current = 0;
         const sessionResult = await opened.rpc<{ sessions: UiSession[] }>(
           "sessions.list",
         );
-        if (disposed || abortController.signal.aborted) return;
+        if (
+          disposed ||
+          abortController.signal.aborted ||
+          hostGenerationRef.current !== generation
+        )
+          return;
+        sessionsByHostRef.current.set(host.hostId, sessionResult.sessions);
         setSessions(sessionResult.sessions);
+        setSessionsPhase(sessionResult.sessions.length ? "ready" : "empty");
         setSessionId((current) =>
           sessionResult.sessions.some(
             (item) => item.upstreamSessionId === current,
@@ -632,9 +993,20 @@ export default function App() {
           })
           .catch(() => undefined);
       } catch (nextError) {
-        if (!disposed && !abortController.signal.aborted) {
+        if (
+          !disposed &&
+          !abortController.signal.aborted &&
+          hostGenerationRef.current === generation
+        ) {
+          if (nextError instanceof ApiError && nextError.status === 401) {
+            setAuthRequired(true);
+            return;
+          }
           setError(
             nextError instanceof Error ? nextError.message : "主机通道连接失败",
+          );
+          setSessionsPhase(
+            host.state === "offline" ? "offline" : "reconnecting",
           );
           setStatus("状态异常 · 正在重连");
           scheduleBrowserReconnect();
@@ -661,6 +1033,66 @@ export default function App() {
     void refreshSession(sessionId, channel);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channel, demo, sessionId]);
+
+  useEffect(() => {
+    if (demo || !channel || !sessionId) return;
+    if (
+      !Object.values(promptActions).some(
+        (state) => state === "pending-confirmation",
+      )
+    )
+      return;
+    void verifyPendingPromptActions(channel, sessionId);
+    // A new encrypted channel is the only safe trigger for read-only confirmation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channel, demo, sessionId]);
+
+  useEffect(() => {
+    if (!modelOptions.length || !sessionId) return;
+    const draft = composerDraftRef.current.get(sessionId);
+    const currentModel = draft?.model || selectedModel;
+    const validModel = modelOptions.some((item) => item.model === currentModel)
+      ? currentModel
+      : (modelOptions[0]?.model ?? "");
+    if (validModel && validModel !== selectedModel)
+      setSelectedModel(validModel);
+    const descriptor = modelOptions.find((item) => item.model === validModel);
+    const efforts = supportedEfforts(descriptor?.support_efforts);
+    if (thinkingLevel && !efforts.includes(thinkingLevel)) {
+      setThinkingLevel("");
+      composerDraftRef.current.set(sessionId, {
+        model: validModel,
+        thinkingLevel: "",
+      });
+    }
+  }, [modelOptions, selectedModel, sessionId, thinkingLevel]);
+
+  useEffect(() => {
+    if (demo || !channel || !host || view !== "archive") return;
+    let active = true;
+    setArchiveLoading(true);
+    void channel
+      .rpc<{ sessions: UiSession[] }>("sessions.list", {
+        includeArchived: true,
+        archivedOnly: true,
+        pageSize: 100,
+      })
+      .then((result) => {
+        if (active) setArchivedSessions(result.sessions ?? []);
+      })
+      .catch((nextError) => {
+        if (active)
+          setError(
+            nextError instanceof Error ? nextError.message : "加载归档对话失败",
+          );
+      })
+      .finally(() => {
+        if (active) setArchiveLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [channel, demo, host?.hostId, view]);
 
   useEffect(() => {
     if (demo || !channel || !sessionId) return;
@@ -723,16 +1155,25 @@ export default function App() {
   }, [channel, demo, sessionId]);
 
   useEffect(() => {
-    if (view !== "terminal" || demo || !host) return;
+    if (demo) {
+      setTerminalPhase(view === "terminal" ? "ready" : "offline");
+      return;
+    }
+    if (view !== "terminal" || !host) {
+      setTerminalPhase("offline");
+      return;
+    }
     if (host.state !== "online") {
       terminalChannel?.close();
       setTerminalChannel(null);
       setTerminalOutput(null);
+      setTerminalPhase("offline");
       return;
     }
     let disposed = false;
     let opened: RelayChannel | null = null;
     const abortController = new AbortController();
+    setTerminalPhase(terminalChannel ? "reconnecting" : "loading");
     terminalChannel?.close();
     void relay
       .open(
@@ -766,6 +1207,7 @@ export default function App() {
               data: value.data as string,
             }));
           } else if (value?.type === "channel.disconnected" && !disposed) {
+            setTerminalPhase("reconnecting");
             window.setTimeout(
               () => setTerminalGeneration((generation) => generation + 1),
               1_500,
@@ -777,10 +1219,14 @@ export default function App() {
       .then((nextChannel) => {
         opened = nextChannel;
         if (disposed) nextChannel.close();
-        else setTerminalChannel(nextChannel);
+        else {
+          setTerminalChannel(nextChannel);
+          setTerminalPhase("ready");
+        }
       })
       .catch((nextError: unknown) => {
         if (!disposed) {
+          setTerminalPhase("error");
           setError(
             nextError instanceof Error ? nextError.message : "终端连接失败",
           );
@@ -795,6 +1241,7 @@ export default function App() {
       abortController.abort();
       opened?.close();
       setTerminalChannel(null);
+      if (view === "terminal") setTerminalPhase("reconnecting");
     };
     // Terminal mode switches and relay failures require a fresh encrypted channel.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1108,7 +1555,13 @@ export default function App() {
     if (!activeChannel) return;
     void activeChannel
       .rpc<{ sessions: UiSession[] }>("sessions.list")
-      .then((result) => setSessions(result.sessions))
+      .then((result) => {
+        if (channelRef.current !== activeChannel) return;
+        if (hostId)
+          sessionsByHostRef.current.set(hostId, result.sessions ?? []);
+        setSessions(result.sessions ?? []);
+        setSessionsPhase(result.sessions?.length ? "ready" : "empty");
+      })
       .catch(() => undefined);
   }
 
@@ -1215,6 +1668,11 @@ export default function App() {
   async function reconcileTranscript(targetSessionId: string) {
     const activeChannel = channelRef.current;
     if (!activeChannel || !targetSessionId) return;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
     const current =
       transcriptSessionIdRef.current === targetSessionId
         ? transcriptRef.current
@@ -1237,9 +1695,11 @@ export default function App() {
             if (applied.gap) throw new Error("transcript gap");
             next = applied.state;
           }
-          if (activeSessionRef.current === targetSessionId) {
+          if (isCurrent()) {
             transcriptRef.current = next;
             setTranscript(next);
+          } else {
+            return;
           }
           clearTranscriptRetry();
           setError(null);
@@ -1258,7 +1718,7 @@ export default function App() {
           pageSize: 20,
         },
       );
-      if (activeSessionRef.current === targetSessionId) {
+      if (isCurrent()) {
         const nextTranscript = mergeTranscriptPage(
           transcriptRef.current,
           transcriptSessionIdRef.current,
@@ -1275,8 +1735,11 @@ export default function App() {
         } else {
           scheduleTranscriptRetry(targetSessionId);
         }
+      } else {
+        return;
       }
     } catch (nextError) {
+      if (!isCurrent()) return;
       setError(
         nextError instanceof Error ? nextError.message : "恢复对话记录失败",
       );
@@ -1308,25 +1771,40 @@ export default function App() {
 
   async function loadOlderTurns() {
     if (!channel || !session || !transcript || loadingOlder) return;
+    const targetSessionId = session.upstreamSessionId;
+    const activeChannel = channel;
+    const generation = hostGenerationRef.current;
     const oldest = transcript.items.find((item) => item.kind === "turn");
     if (!oldest || oldest.kind !== "turn") return;
     setLoadingOlder(true);
     try {
-      const page = await channel.rpc<TranscriptPage>(
+      const page = await activeChannel.rpc<TranscriptPage>(
         "sessions.transcript.read",
         {
-          sessionId: session.upstreamSessionId,
+          sessionId: targetSessionId,
           agentId: transcript.agentId,
           pageSize: 20,
           beforeTurn: oldest.turnId,
         },
       );
+      if (
+        channelRef.current !== activeChannel ||
+        activeSessionRef.current !== targetSessionId ||
+        hostGenerationRef.current !== generation
+      )
+        return;
       const nextTranscript = transcriptRef.current
         ? prependTranscriptPage(transcriptRef.current, page)
         : transcriptFromPage(page);
       transcriptRef.current = nextTranscript;
       setTranscript(nextTranscript);
     } catch (nextError) {
+      if (
+        channelRef.current !== activeChannel ||
+        activeSessionRef.current !== targetSessionId ||
+        hostGenerationRef.current !== generation
+      )
+        return;
       setError(
         nextError instanceof Error ? nextError.message : "加载更早记录失败",
       );
@@ -1337,32 +1815,44 @@ export default function App() {
 
   async function setPermission(mode: PermissionMode) {
     if (!session) return;
+    const targetSessionId = session.upstreamSessionId;
+    const activeChannel = channel;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation &&
+      (demo || channelRef.current === activeChannel);
     const previous = session.permissionMode;
+    if (!demo && !activeChannel) return;
     setSessions((current) =>
       current.map((item) =>
-        item.upstreamSessionId === session.upstreamSessionId
+        item.upstreamSessionId === targetSessionId
           ? { ...item, permissionMode: mode }
           : item,
       ),
     );
     if (demo) return;
+    if (!activeChannel) return;
     try {
-      const actual = await channel?.rpc<{ permissionMode: PermissionMode }>(
-        "sessions.permission.write",
-        { sessionId: session.upstreamSessionId, permissionMode: mode },
-      );
-      if (actual)
+      const actual = await activeChannel.rpc<{
+        permissionMode: PermissionMode;
+      }>("sessions.permission.write", {
+        sessionId: targetSessionId,
+        permissionMode: mode,
+      });
+      if (actual && isCurrent())
         setSessions((current) =>
           current.map((item) =>
-            item.upstreamSessionId === session.upstreamSessionId
+            item.upstreamSessionId === targetSessionId
               ? { ...item, permissionMode: actual.permissionMode }
               : item,
           ),
         );
     } catch (nextError) {
+      if (!isCurrent()) return;
       setSessions((current) =>
         current.map((item) =>
-          item.upstreamSessionId === session.upstreamSessionId
+          item.upstreamSessionId === targetSessionId
             ? { ...item, permissionMode: previous }
             : item,
         ),
@@ -1379,9 +1869,11 @@ export default function App() {
       (!text && attachments.length === 0) ||
       !session ||
       host?.state !== "online" ||
+      (!demo && !channel) ||
       sending
     )
       return;
+    markCompletedTurnsCollapsed();
     if (text.startsWith("/")) {
       const [head] = text.slice(1).split(/\s/u);
       const command = commands.find(
@@ -1396,8 +1888,28 @@ export default function App() {
         return;
       }
     }
+    const targetSession = session;
+    const targetSessionId = targetSession.upstreamSessionId;
+    const requestGeneration = ++sendRequestRef.current;
+    const hostGeneration = hostGenerationRef.current;
+    const isCurrentRequest = () =>
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === hostGeneration &&
+      sendRequestRef.current === requestGeneration;
+    const pendingAttachmentIds = attachments.map((item) => item.id);
+    const retry = retryPromptRef.current;
+    const promptId =
+      retry &&
+      retry.sessionId === session.upstreamSessionId &&
+      retry.text === text &&
+      retry.attachmentIds.length === pendingAttachmentIds.length &&
+      retry.attachmentIds.every(
+        (attachmentId, index) => attachmentId === pendingAttachmentIds[index],
+      )
+        ? retry.promptId
+        : crypto.randomUUID();
     const message: UiMessage = {
-      id: crypto.randomUUID(),
+      id: promptId,
       role: "user",
       text: text || `已添加 ${attachments.length} 个附件`,
       time: new Date().toISOString(),
@@ -1408,6 +1920,7 @@ export default function App() {
       setAttachments([]);
       window.setTimeout(
         () =>
+          isCurrentRequest() &&
           setMessages((current) => [
             ...current,
             {
@@ -1462,16 +1975,20 @@ export default function App() {
       }
       if (!channel) throw new Error("主机通道不可用");
       await channel.rpc("sessions.prompt", {
-        sessionId: session.upstreamSessionId,
+        sessionId: targetSessionId,
         promptId: message.id,
         content,
-        permissionMode: session.permissionMode,
+        permissionMode: targetSession.permissionMode,
         ...(selectedModel ? { model: selectedModel } : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
         planMode,
       });
-      setAttachments([]);
+      if (isCurrentRequest()) {
+        setAttachments([]);
+        retryPromptRef.current = null;
+      }
     } catch (nextError) {
+      if (!isCurrentRequest()) return;
       setMessages((current) =>
         current.filter((item) => item.id !== message.id),
       );
@@ -1484,11 +2001,17 @@ export default function App() {
           error: nextError instanceof Error ? nextError.message : "上传失败",
         })),
       );
+      retryPromptRef.current = {
+        sessionId: targetSessionId,
+        promptId: message.id,
+        text,
+        attachmentIds: pendingAttachmentIds,
+      };
       setError(
         nextError instanceof Error ? nextError.message : "发送提示词失败",
       );
     } finally {
-      setSending(false);
+      if (sendRequestRef.current === requestGeneration) setSending(false);
     }
   }
 
@@ -1529,19 +2052,163 @@ export default function App() {
 
   async function controlPrompt(promptId: string, action: "steer" | "abort") {
     if (!channel || !session) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
+    const lockKey = `${hostId}:${targetSessionId}:${promptId}`;
+    if (promptActionLocksRef.current.has(lockKey)) return;
+    const currentState = promptActions[promptId] ?? "idle";
+    if (currentState === "applying" || currentState === "pending-confirmation")
+      return;
+    promptActionLocksRef.current.add(lockKey);
+    setPromptActions((current) => ({ ...current, [promptId]: "applying" }));
     try {
-      await channel.rpc(
+      await activeChannel.rpc(
         `sessions.prompts.${action}` as "sessions.prompts.steer",
         {
-          sessionId: session.upstreamSessionId,
+          sessionId: targetSessionId,
           promptId,
         },
       );
+      if (!isCurrent()) return;
+      setPromptActions((current) => ({
+        ...current,
+        [promptId]: "pending-confirmation",
+      }));
+      let confirmed = false;
+      for (const delay of [120, 300, 700, 1_200]) {
+        await waitFor(delay);
+        if (!isCurrent()) return;
+        try {
+          const result = await activeChannel.rpc<{
+            prompts?: Array<Record<string, unknown>>;
+            items?: Array<Record<string, unknown>>;
+          }>("sessions.prompts.list", {
+            sessionId: session.upstreamSessionId,
+          });
+          const prompts = result.prompts ?? result.items ?? [];
+          const prompt = prompts.find(
+            (item) =>
+              String(item.promptId ?? item.prompt_id ?? "") === promptId,
+          );
+          const state = String(
+            prompt?.status ?? prompt?.state ?? "",
+          ).toLowerCase();
+          confirmed =
+            action === "abort"
+              ? !prompt ||
+                ["aborted", "cancelled", "canceled", "failed"].includes(state)
+              : !prompt || !["queued", "pending", "blocked"].includes(state);
+          if (confirmed) break;
+        } catch {
+          if (!isCurrent()) return;
+          // The next transcript/snapshot refresh remains the confirmation source.
+        }
+      }
+      if (!confirmed) {
+        if (!isCurrent()) return;
+        setPromptActions((current) => ({
+          ...current,
+          [promptId]: "pending-confirmation",
+        }));
+        setError("消息操作已发出，等待主机确认");
+        return;
+      }
+      if (!isCurrent()) return;
+      setPromptActions((current) => ({ ...current, [promptId]: "confirmed" }));
+      window.setTimeout(() => {
+        if (!isCurrent()) return;
+        setPromptActions((current) => {
+          const next = { ...current };
+          delete next[promptId];
+          return next;
+        });
+      }, 1800);
+      try {
+        await reconcileTranscript(targetSessionId);
+      } catch {
+        // Confirmation already came from the prompt queue; transcript recovery is independent.
+      }
     } catch (nextError) {
+      if (!isCurrent()) return;
+      if (isTransientPromptChannelError(nextError)) {
+        setPromptActions((current) => ({
+          ...current,
+          [promptId]: "pending-confirmation",
+        }));
+        setError("消息操作已经发出，通道正在恢复，稍后只读核对结果");
+        return;
+      }
+      setPromptActions((current) => ({ ...current, [promptId]: "failed" }));
       setError(
         nextError instanceof Error ? nextError.message : "消息队列操作失败",
       );
+    } finally {
+      promptActionLocksRef.current.delete(lockKey);
     }
+  }
+
+  async function verifyPendingPromptActions(
+    activeChannel: RelayChannel,
+    targetSessionId: string,
+  ) {
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
+    const pendingIds = Object.entries(promptActions)
+      .filter(([, state]) => state === "pending-confirmation")
+      .map(([promptId]) => promptId);
+    if (!pendingIds.length) return;
+    try {
+      const result = await activeChannel.rpc<{
+        prompts?: Array<Record<string, unknown>>;
+      }>("sessions.prompts.list", { sessionId: targetSessionId });
+      const prompts = result.prompts ?? [];
+      const confirmedIds = pendingIds.filter((promptId) => {
+        const prompt = prompts.find(
+          (item) => String(item.promptId ?? item.prompt_id ?? "") === promptId,
+        );
+        const state = String(
+          prompt?.status ?? prompt?.state ?? "",
+        ).toLowerCase();
+        return !prompt || !["queued", "pending", "blocked"].includes(state);
+      });
+      if (!isCurrent()) return;
+      setPromptActions((current) => {
+        const next = { ...current };
+        for (const promptId of confirmedIds) next[promptId] = "confirmed";
+        return next;
+      });
+      for (const promptId of confirmedIds)
+        window.setTimeout(() => {
+          if (!isCurrent()) return;
+          setPromptActions((current) => {
+            const next = { ...current };
+            delete next[promptId];
+            return next;
+          });
+        }, 1800);
+    } catch {
+      // Keep pending-confirmation; the next reconnect or user-visible refresh retries read-only.
+    }
+  }
+
+  function isTransientPromptChannelError(error: unknown): boolean {
+    if (error instanceof ApiError)
+      return (
+        error.status >= 500 ||
+        ["host_offline", "host_degraded"].includes(error.code)
+      );
+    return (
+      error instanceof Error &&
+      /中继|通道|代理|主机已离线|超时|断开|重连/u.test(error.message)
+    );
   }
 
   function chooseCommand(command: CommandDescriptor) {
@@ -1562,6 +2229,13 @@ export default function App() {
     argument: string,
   ) {
     if (!session || !channel) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
     if (sessionStatus?.busy && command.busy === false) {
       setError(`/${command.name} 需要等待当前任务结束`);
       return;
@@ -1571,38 +2245,44 @@ export default function App() {
       return;
     }
     if (command.kind === "skill") {
+      markCompletedTurnsCollapsed();
       try {
-        await channel.rpc("sessions.skills.activate", {
-          sessionId: session.upstreamSessionId,
+        await activeChannel.rpc("sessions.skills.activate", {
+          sessionId: targetSessionId,
           skillName: command.skillName ?? command.name,
           args: argument || undefined,
         });
-        setPrompt("");
+        if (isCurrent()) setPrompt("");
       } catch (nextError) {
-        setError(
-          nextError instanceof Error ? nextError.message : "技能激活失败",
-        );
+        if (isCurrent())
+          setError(
+            nextError instanceof Error ? nextError.message : "技能激活失败",
+          );
       }
       return;
     }
     if (command.kind === "agent") {
+      markCompletedTurnsCollapsed();
       if (command.name === "title" && !argument) {
         setError("请输入新标题，例如 /title 新标题");
         return;
       }
       try {
-        await channel.rpc("sessions.commands.execute", {
-          sessionId: session.upstreamSessionId,
+        await activeChannel.rpc("sessions.commands.execute", {
+          sessionId: targetSessionId,
           name: command.name,
           ...(command.name === "title" ? { title: argument } : {}),
         });
-        setPrompt("");
-        scheduleRefresh();
-        scheduleSessionListRefresh();
+        if (isCurrent()) {
+          setPrompt("");
+          scheduleRefresh();
+          scheduleSessionListRefresh();
+        }
       } catch (nextError) {
-        setError(
-          nextError instanceof Error ? nextError.message : "命令执行失败",
-        );
+        if (isCurrent())
+          setError(
+            nextError instanceof Error ? nextError.message : "命令执行失败",
+          );
       }
       return;
     }
@@ -1674,18 +2354,28 @@ export default function App() {
 
   async function createSession(input: NewSessionInput) {
     if (!channel || !host) return;
+    const activeChannel = channel;
+    const targetHostId = host.hostId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      hostGenerationRef.current === generation;
+    pendingWorkspaceSessionRef.current = input;
+    setWorkspaceMissing(false);
     try {
-      const result = await channel.rpc<{ session: UiSession }>(
+      const result = await activeChannel.rpc<{ session: UiSession }>(
         "sessions.create",
         {
           ...(input.title ? { title: input.title } : {}),
           metadata: { cwd: input.workspace },
         },
       );
-      await channel.rpc("sessions.permission.write", {
+      if (!isCurrent()) return;
+      await activeChannel.rpc("sessions.permission.write", {
         sessionId: result.session.upstreamSessionId,
         permissionMode: input.permissionMode,
       });
+      if (!isCurrent()) return;
       const created = {
         ...result.session,
         permissionMode: input.permissionMode,
@@ -1699,19 +2389,88 @@ export default function App() {
       setSessionId(created.upstreamSessionId);
       setView("conversation");
       setNewSessionOpen(false);
+      pendingWorkspaceSessionRef.current = null;
+      const storageKey = `aialra-workspaces:${targetHostId}`;
+      let recent: WorkspaceOption[] = [];
+      try {
+        const parsed = JSON.parse(localStorage.getItem(storageKey) ?? "[]");
+        if (Array.isArray(parsed))
+          recent = parsed.filter((item): item is WorkspaceOption =>
+            Boolean(
+              item &&
+                typeof item.root === "string" &&
+                typeof item.name === "string",
+            ),
+          );
+      } catch {
+        recent = [];
+      }
+      const name =
+        input.workspace.split(/[\\/]/u).filter(Boolean).at(-1) ??
+        input.workspace;
+      const next = [
+        { root: input.workspace, name },
+        ...recent.filter((item) => item.root !== input.workspace),
+      ].slice(0, 20);
+      localStorage.setItem(storageKey, JSON.stringify(next));
+      setWorkspaceOptions(next);
     } catch (nextError) {
+      if (!isCurrent()) return;
+      const message = nextError instanceof Error ? nextError.message : "";
+      if (/40409|workspace.*(not found|不存在)|工作区不存在/iu.test(message)) {
+        setWorkspaceMissing(true);
+        setError("工作区不存在，请确认后创建目标主机工作区");
+        return;
+      }
       setError(nextError instanceof Error ? nextError.message : "创建会话失败");
+    }
+  }
+
+  async function ensureWorkspaceAndRetry() {
+    if (!channel || !host) return;
+    const activeChannel = channel;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      hostGenerationRef.current === generation;
+    const input = pendingWorkspaceSessionRef.current;
+    if (!input) return;
+    setActionBusy(true);
+    try {
+      await activeChannel.rpc("workspaces.ensure", {
+        root: input.workspace,
+        confirmed: true,
+        name:
+          input.workspace.split(/[\\/]/u).filter(Boolean).at(-1) ??
+          input.workspace,
+      });
+      if (!isCurrent()) return;
+      setWorkspaceMissing(false);
+      await createSession(input);
+    } catch (nextError) {
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "创建工作区失败",
+        );
+    } finally {
+      if (isCurrent()) setActionBusy(false);
     }
   }
 
   async function archiveSession(target = session) {
     if (!channel || !target) return;
+    const activeChannel = channel;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      hostGenerationRef.current === generation;
     setActionBusy(true);
     try {
-      await channel.rpc("sessions.archive", {
+      await activeChannel.rpc("sessions.archive", {
         sessionId: target.upstreamSessionId,
       });
-      let verified = await channel.rpc<{ sessions: UiSession[] }>(
+      if (!isCurrent()) return;
+      let verified = await activeChannel.rpc<{ sessions: UiSession[] }>(
         "sessions.list",
       );
       for (const delay of [150, 400, 900]) {
@@ -1722,7 +2481,8 @@ export default function App() {
         )
           break;
         await waitFor(delay);
-        verified = await channel.rpc<{ sessions: UiSession[] }>(
+        if (!isCurrent()) return;
+        verified = await activeChannel.rpc<{ sessions: UiSession[] }>(
           "sessions.list",
         );
       }
@@ -1732,7 +2492,18 @@ export default function App() {
         )
       )
         throw new Error("上游尚未确认归档，请稍后重试");
+      if (!isCurrent()) return;
       setSessions(verified.sessions);
+      void activeChannel
+        .rpc<{ sessions: UiSession[] }>("sessions.list", {
+          includeArchived: true,
+          archivedOnly: true,
+          pageSize: 100,
+        })
+        .then((result) => {
+          if (isCurrent()) setArchivedSessions(result.sessions ?? []);
+        })
+        .catch(() => undefined);
       setSessionId((current) =>
         current === target.upstreamSessionId
           ? (verified.sessions[0]?.upstreamSessionId ?? "")
@@ -1741,16 +2512,59 @@ export default function App() {
       setPinnedSessionIds((current) => {
         const next = new Set(current);
         next.delete(target.upstreamSessionId);
-        if (host && !demo)
+        if (isCurrent() && host && !demo)
           void api
             .updateHostPreferences(host.hostId, newSessionDefault, [...next])
             .catch(() => undefined);
         return next;
       });
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "归档会话失败");
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "归档会话失败",
+        );
     } finally {
-      setActionBusy(false);
+      if (isCurrent()) setActionBusy(false);
+    }
+  }
+
+  async function restoreSession(target: UiSession) {
+    if (!channel) return;
+    const activeChannel = channel;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      hostGenerationRef.current === generation;
+    setActionBusy(true);
+    try {
+      await activeChannel.rpc("sessions.restore", {
+        sessionId: target.upstreamSessionId,
+      });
+      if (!isCurrent()) return;
+      const [activeResult, archivedResult] = await Promise.all([
+        activeChannel.rpc<{ sessions: UiSession[] }>("sessions.list"),
+        activeChannel.rpc<{ sessions: UiSession[] }>("sessions.list", {
+          includeArchived: true,
+          archivedOnly: true,
+          pageSize: 100,
+        }),
+      ]);
+      if (!isCurrent()) return;
+      setSessions(activeResult.sessions ?? []);
+      setArchivedSessions(archivedResult.sessions ?? []);
+      setSessionsPhase(activeResult.sessions?.length ? "ready" : "empty");
+      setView("conversation");
+      setSessionId(target.upstreamSessionId);
+    } catch (nextError) {
+      if (!isCurrent()) return;
+      const message = nextError instanceof Error ? nextError.message : "";
+      setError(
+        /unsupported|not found|404/iu.test(message)
+          ? "当前 Kimi 版本不支持恢复归档对话"
+          : message || "恢复归档对话失败",
+      );
+    } finally {
+      if (isCurrent()) setActionBusy(false);
     }
   }
 
@@ -1761,18 +2575,25 @@ export default function App() {
 
   async function renameSession() {
     if (!channel || !renameTarget) return;
+    const activeChannel = channel;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      hostGenerationRef.current === generation;
     const target = renameTarget;
     const title = renameTitle.trim();
     if (!title || title === target.title) return;
     setActionBusy(true);
     try {
-      await channel.rpc("sessions.title.write", {
+      await activeChannel.rpc("sessions.title.write", {
         sessionId: target.upstreamSessionId,
         title,
       });
-      const verified = await channel.rpc<{ sessions: UiSession[] }>(
+      if (!isCurrent()) return;
+      const verified = await activeChannel.rpc<{ sessions: UiSession[] }>(
         "sessions.list",
       );
+      if (!isCurrent()) return;
       const updated = verified.sessions.find(
         (item) => item.upstreamSessionId === target.upstreamSessionId,
       );
@@ -1782,11 +2603,12 @@ export default function App() {
       setRenameTarget(null);
       setRenameTitle("");
     } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "重命名对话失败",
-      );
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "重命名对话失败",
+        );
     } finally {
-      setActionBusy(false);
+      if (isCurrent()) setActionBusy(false);
     }
   }
 
@@ -1798,14 +2620,23 @@ export default function App() {
     else next.add(target.upstreamSessionId);
     setPinnedSessionIds(next);
     if (!host || demo) return;
+    const targetHostId = host.hostId;
+    const generation = hostGenerationRef.current;
     try {
       const actual = await api.updateHostPreferences(
-        host.hostId,
+        targetHostId,
         newSessionDefault,
         [...next],
       );
+      if (
+        hostGenerationRef.current !== generation ||
+        hostsRef.current.find((item) => item.hostId === targetHostId) ===
+          undefined
+      )
+        return;
       setPinnedSessionIds(new Set(actual.pinnedSessionIds ?? [...next]));
     } catch (nextError) {
+      if (hostGenerationRef.current !== generation) return;
       setPinnedSessionIds(previous);
       setError(
         nextError instanceof Error ? nextError.message : "更新置顶状态失败",
@@ -1815,38 +2646,58 @@ export default function App() {
 
   async function forkSession() {
     if (!channel || !session) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const targetPermissionMode = session.permissionMode;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
     setActionBusy(true);
     try {
-      const result = await channel.rpc<{ session: UiSession }>(
+      const result = await activeChannel.rpc<{ session: UiSession }>(
         "sessions.fork",
         {
-          sessionId: session.upstreamSessionId,
+          sessionId: targetSessionId,
           title: `${session.title} (fork)`,
         },
       );
+      if (!isCurrent()) return;
       setSessions((current) => [
-        { ...result.session, permissionMode: session.permissionMode },
+        { ...result.session, permissionMode: targetPermissionMode },
         ...current,
       ]);
       setSessionId(result.session.upstreamSessionId);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "分叉会话失败");
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "分叉会话失败",
+        );
     } finally {
-      setActionBusy(false);
+      if (isCurrent()) setActionBusy(false);
     }
   }
 
   async function interruptSession() {
     if (!channel || !session) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
     try {
-      await channel.rpc("sessions.interrupt", {
-        sessionId: session.upstreamSessionId,
+      await activeChannel.rpc("sessions.interrupt", {
+        sessionId: targetSessionId,
       });
-      scheduleRefresh();
+      if (isCurrent()) scheduleRefresh();
     } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "停止当前任务失败",
-      );
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "停止当前任务失败",
+        );
     }
   }
 
@@ -1855,21 +2706,29 @@ export default function App() {
     decision: "approved" | "rejected",
   ) {
     if (!channel || !session) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
     setActionBusy(true);
     try {
-      await channel.rpc("sessions.approvals.respond", {
-        sessionId: session.upstreamSessionId,
+      await activeChannel.rpc("sessions.approvals.respond", {
+        sessionId: targetSessionId,
         interactionId,
         decision,
         scope: "session",
       });
-      await refreshSession(session.upstreamSessionId, channel);
+      if (isCurrent()) await refreshSession(targetSessionId, activeChannel);
     } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "提交审批结果失败",
-      );
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "提交审批结果失败",
+        );
     } finally {
-      setActionBusy(false);
+      if (isCurrent()) setActionBusy(false);
     }
   }
 
@@ -1878,75 +2737,118 @@ export default function App() {
     answers: Record<string, unknown>,
   ) {
     if (!channel || !session) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
     setActionBusy(true);
     try {
-      await channel.rpc("sessions.questions.respond", {
-        sessionId: session.upstreamSessionId,
+      await activeChannel.rpc("sessions.questions.respond", {
+        sessionId: targetSessionId,
         interactionId,
         answers,
         method: "click",
       });
-      await refreshSession(session.upstreamSessionId, channel);
+      if (isCurrent()) await refreshSession(targetSessionId, activeChannel);
     } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "提交问题回答失败",
-      );
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "提交问题回答失败",
+        );
     } finally {
-      setActionBusy(false);
+      if (isCurrent()) setActionBusy(false);
     }
   }
 
   async function dismissQuestion(interactionId: string) {
     if (!channel || !session) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      activeSessionRef.current === targetSessionId &&
+      hostGenerationRef.current === generation;
     setActionBusy(true);
     try {
-      await channel.rpc("sessions.questions.dismiss", {
-        sessionId: session.upstreamSessionId,
+      await activeChannel.rpc("sessions.questions.dismiss", {
+        sessionId: targetSessionId,
         interactionId,
       });
-      await refreshSession(session.upstreamSessionId, channel);
+      if (isCurrent()) await refreshSession(targetSessionId, activeChannel);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "忽略问题失败");
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "忽略问题失败",
+        );
     } finally {
-      setActionBusy(false);
+      if (isCurrent()) setActionBusy(false);
     }
   }
 
   async function openFile(path: string) {
     if (!channel || !session) return;
+    const activeChannel = channel;
+    const targetSessionId = session.upstreamSessionId;
+    const generation = hostGenerationRef.current;
     try {
-      setFilePreview(
-        await channel.rpc<UiFileRead>("sessions.files.read", {
-          sessionId: session.upstreamSessionId,
+      const preview = await activeChannel.rpc<UiFileRead>(
+        "sessions.files.read",
+        {
+          sessionId: targetSessionId,
           path,
-        }),
+        },
       );
+      if (
+        channelRef.current === activeChannel &&
+        activeSessionRef.current === targetSessionId &&
+        hostGenerationRef.current === generation
+      )
+        setFilePreview(preview);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "读取文件失败");
+      if (
+        channelRef.current === activeChannel &&
+        activeSessionRef.current === targetSessionId &&
+        hostGenerationRef.current === generation
+      )
+        setError(
+          nextError instanceof Error ? nextError.message : "读取文件失败",
+        );
     }
   }
 
   async function startKimiLogin() {
     if (!channel || !host) return;
+    const activeChannel = channel;
     const targetHostId = host.hostId;
+    const generation = hostGenerationRef.current;
+    const isCurrent = () =>
+      channelRef.current === activeChannel &&
+      hostGenerationRef.current === generation &&
+      oauthHostRef.current === targetHostId;
     oauthHostRef.current = targetHostId;
     try {
-      const flow = await channel.rpc<OAuthFlow>("oauth.device.start", {
+      const flow = await activeChannel.rpc<OAuthFlow>("oauth.device.start", {
         region: oauthRegion,
       });
-      if (oauthHostRef.current !== targetHostId) return;
+      if (!isCurrent()) return;
       setOauthFlow(flow);
-      if (flow.status === "authenticated") return void refreshUsage(channel);
+      if (flow.status === "authenticated")
+        return void refreshUsage(activeChannel, generation);
       const destination = allowedKimiVerificationUrl(
         flow.verification_uri_complete ?? flow.verification_uri,
       );
       if (oauthRegion === "global" && destination)
         window.open(destination, "_blank", "noopener,noreferrer");
-      scheduleOAuthPoll(flow, channel, targetHostId);
+      scheduleOAuthPoll(flow, activeChannel, targetHostId, generation);
     } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "Kimi 登录失败",
-      );
+      if (isCurrent())
+        setError(
+          nextError instanceof Error ? nextError.message : "Kimi 登录失败",
+        );
     }
   }
 
@@ -1954,8 +2856,14 @@ export default function App() {
     flow: OAuthFlow,
     activeChannel: RelayChannel,
     targetHostId: string,
+    generation: number,
   ) {
-    if (flow.status !== "pending" || oauthHostRef.current !== targetHostId)
+    if (
+      flow.status !== "pending" ||
+      oauthHostRef.current !== targetHostId ||
+      channelRef.current !== activeChannel ||
+      hostGenerationRef.current !== generation
+    )
       return;
     oauthTimer.current = window.setTimeout(
       async () => {
@@ -1964,26 +2872,45 @@ export default function App() {
             "oauth.device.poll",
             {},
           );
-          if (!next || oauthHostRef.current !== targetHostId) return;
+          if (
+            !next ||
+            oauthHostRef.current !== targetHostId ||
+            channelRef.current !== activeChannel ||
+            hostGenerationRef.current !== generation
+          )
+            return;
           setOauthFlow(next);
           if (next.status === "authenticated")
-            await refreshUsage(activeChannel);
-          else scheduleOAuthPoll(next, activeChannel, targetHostId);
+            await refreshUsage(activeChannel, generation);
+          else scheduleOAuthPoll(next, activeChannel, targetHostId, generation);
         } catch (nextError) {
-          setError(
-            nextError instanceof Error
-              ? nextError.message
-              : "查询 Kimi 登录状态失败",
-          );
+          if (
+            channelRef.current === activeChannel &&
+            hostGenerationRef.current === generation &&
+            oauthHostRef.current === targetHostId
+          )
+            setError(
+              nextError instanceof Error
+                ? nextError.message
+                : "查询 Kimi 登录状态失败",
+            );
         }
       },
       Math.max(1, flow.interval ?? 5) * 1000,
     );
   }
 
-  async function refreshUsage(activeChannel = channel) {
+  async function refreshUsage(
+    activeChannel = channel,
+    generation = hostGenerationRef.current,
+  ) {
     if (!activeChannel) return;
-    setUsage(await activeChannel.rpc<UsageSnapshot>("oauth.usage"));
+    const snapshot = await activeChannel.rpc<UsageSnapshot>("oauth.usage");
+    if (
+      channelRef.current === activeChannel &&
+      hostGenerationRef.current === generation
+    )
+      setUsage(snapshot);
   }
 
   async function changeElevation(next: boolean) {
@@ -2026,28 +2953,15 @@ export default function App() {
 
   if (authRequired) {
     return (
-      <main className="login-screen">
-        <div className="login-card">
-          <div className="brand-mark">K</div>
-          <p className="eyebrow">私有控制台</p>
-          <h1>集中管理你的 Kimi 主机</h1>
-          <p>
-            通过已配置的身份服务登录，仅所有者组可以访问，并且必须完成多因素验证
-          </p>
-          <a className="primary-button" href="/auth/login">
-            使用 Authentik 登录
-          </a>
-          <div className="security-note">
-            <ShieldCheck size={17} /> 主机内容只保留在所选设备上
-          </div>
-        </div>
+      <main className="auth-redirect" aria-live="polite">
+        <p>正在跳转到身份服务</p>
       </main>
     );
   }
 
   return (
     <div
-      className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${rightPanel && view === "conversation" && session ? "" : "details-closed"}`}
+      className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${rightPanel ? "" : "details-closed"}`}
     >
       <header className="topbar">
         <button
@@ -2088,7 +3002,11 @@ export default function App() {
             aria-label={rightPanel ? "收起详情面板" : "展开详情面板"}
             title={rightPanel ? "收起详情面板" : "展开详情面板"}
           >
-            <PanelRightClose size={18} />
+            {rightPanel ? (
+              <PanelRightClose size={18} />
+            ) : (
+              <PanelRightOpen size={18} />
+            )}
           </button>
           <button
             className="icon-button"
@@ -2152,6 +3070,16 @@ export default function App() {
                 </button>
               );
             })}
+            {hostsPhase === "loading" && (
+              <p className="empty-list loading-list" role="status">
+                正在加载主机…
+              </p>
+            )}
+            {hostsPhase === "reconnecting" && hosts.length === 0 && (
+              <p className="empty-list loading-list" role="status">
+                正在恢复主机连接…
+              </p>
+            )}
           </div>
         </div>
         <div className="session-section">
@@ -2234,8 +3162,32 @@ export default function App() {
                 })}
               </section>
             ))}
-            {!filteredSessions.length && (
+            {sessionsPhase === "loading" && (
+              <p className="empty-list loading-list" role="status">
+                正在加载会话…
+              </p>
+            )}
+            {sessionsPhase === "reconnecting" &&
+              filteredSessions.length === 0 && (
+                <p className="empty-list loading-list" role="status">
+                  正在恢复会话…
+                </p>
+              )}
+            {sessionsPhase === "offline" && filteredSessions.length === 0 && (
+              <p className="empty-list" role="status">
+                主机离线，暂无可显示的脱敏会话
+              </p>
+            )}
+            {sessionsPhase === "ready" && !filteredSessions.length && (
+              <p className="empty-list">
+                {query.trim() ? "没有匹配的会话" : "此主机还没有会话"}
+              </p>
+            )}
+            {sessionsPhase === "empty" && !query.trim() && (
               <p className="empty-list">此主机还没有会话</p>
+            )}
+            {sessionsPhase === "error" && (
+              <p className="empty-list">会话暂时无法加载，请稍后重试</p>
             )}
           </div>
         </div>
@@ -2257,6 +3209,15 @@ export default function App() {
             }}
           >
             <Gauge size={17} /> 用量
+          </button>
+          <button
+            className={view === "archive" ? "active" : ""}
+            onClick={() => {
+              setView("archive");
+              setMobileNav(false);
+            }}
+          >
+            <Archive size={17} /> 归档
           </button>
           <button
             className={view === "settings" ? "active" : ""}
@@ -2286,33 +3247,55 @@ export default function App() {
             </button>
           </div>
         )}
-        {view === "conversation" && !session && (
-          <div className="offline-state">
-            <MessageSquare size={28} />
-            <h2>{host ? "尚未选择会话" : "尚未配对主机"}</h2>
-            <p>
-              {host
-                ? "在所选主机上新建会话即可开始"
-                : "请先配对 VPS 或远端主机"}
-            </p>
-            {!host && (
-              <button
-                className="primary-button"
-                onClick={() => setPairingOpen(true)}
-              >
-                <Plus size={16} /> 配对主机
-              </button>
-            )}
-            {host?.state === "online" && (
-              <button
-                className="primary-button"
-                onClick={() => setNewSessionOpen(true)}
-              >
-                <Plus size={16} /> 新建会话
-              </button>
-            )}
+        {view === "conversation" &&
+          !session &&
+          (sessionsPhase === "loading" || sessionsPhase === "reconnecting") && (
+            <div className="offline-state loading-state" role="status">
+              <LoaderCircle className="spin" size={28} />
+              <h2>
+                {sessionsPhase === "loading" ? "正在加载会话" : "正在恢复会话"}
+              </h2>
+              <p>正在等待所选主机返回会话记录，当前主机不会被自动切换</p>
+            </div>
+          )}
+        {view === "conversation" && !session && sessionsPhase === "offline" && (
+          <div className="offline-state" role="status">
+            <WifiOff size={28} />
+            <h2>主机当前离线</h2>
+            <p>仅保留脱敏元数据；主机恢复在线后会自动恢复会话内容</p>
           </div>
         )}
+        {view === "conversation" &&
+          !session &&
+          sessionsPhase !== "offline" &&
+          sessionsPhase !== "loading" &&
+          sessionsPhase !== "reconnecting" && (
+            <div className="offline-state">
+              <MessageSquare size={28} />
+              <h2>{host ? "尚未选择会话" : "尚未配对主机"}</h2>
+              <p>
+                {host
+                  ? "在所选主机上新建会话即可开始"
+                  : "请先配对 VPS 或远端主机"}
+              </p>
+              {!host && (
+                <button
+                  className="primary-button"
+                  onClick={() => setPairingOpen(true)}
+                >
+                  <Plus size={16} /> 配对主机
+                </button>
+              )}
+              {host?.state === "online" && (
+                <button
+                  className="primary-button"
+                  onClick={() => setNewSessionOpen(true)}
+                >
+                  <Plus size={16} /> 新建会话
+                </button>
+              )}
+            </div>
+          )}
         {view === "conversation" && session && (
           <>
             <div className="conversation-head">
@@ -2384,81 +3367,114 @@ export default function App() {
                 </p>
               </div>
             ) : (
-              <div className="conversation-body">
-                <div className="timeline-note">
-                  <Clock3 size={14} />
-                  <span>会话记录</span>
-                </div>
-                {transcriptVisible ? (
-                  <>
-                    <TranscriptTimeline
-                      transcript={transcript!}
-                      hostId={host?.hostId ?? ""}
-                      sessionId={session?.upstreamSessionId ?? ""}
-                      collapseCompleted={Boolean(optimisticMessage)}
-                      onLoadOlder={() => void loadOlderTurns()}
-                      loadingOlder={loadingOlder}
-                    />
-                    {optimisticMessage && (
+              <>
+                <div
+                  className="conversation-body"
+                  ref={conversationScrollRef}
+                  onScroll={handleConversationScroll}
+                >
+                  <div className="timeline-note">
+                    <Clock3 size={14} />
+                    <span>会话记录</span>
+                  </div>
+                  {transcriptVisible ? (
+                    <>
+                      <TranscriptTimeline
+                        transcript={transcript!}
+                        hostId={host?.hostId ?? ""}
+                        sessionId={session?.upstreamSessionId ?? ""}
+                        autoCollapsedTurnIds={autoCollapsedTurnIds}
+                        onLoadOlder={() => void loadOlderTurns()}
+                        loadingOlder={loadingOlder}
+                      />
+                      {optimisticMessage && (
+                        <article
+                          className="message user optimistic-message"
+                          aria-live="polite"
+                        >
+                          <div className="message-avatar">AO</div>
+                          <div className="message-content">
+                            <div className="message-meta">
+                              <strong>你</strong>
+                              <span>{messageTime(optimisticMessage.time)}</span>
+                            </div>
+                            <MarkdownMessage text={optimisticMessage.text} />
+                            <div className="message-actions">
+                              <CopyButton text={optimisticMessage.text} />
+                            </div>
+                          </div>
+                        </article>
+                      )}
+                    </>
+                  ) : (
+                    conversationMessages.map((message) => (
                       <article
-                        className="message user optimistic-message"
-                        aria-live="polite"
+                        key={message.id}
+                        className={`message ${message.role} ${message.isError ? "error" : ""}`}
                       >
-                        <div className="message-avatar">AO</div>
+                        <div className="message-avatar">
+                          {message.role === "assistant" ? (
+                            <Sparkles size={17} />
+                          ) : message.role === "tool" ? (
+                            <Command size={16} />
+                          ) : (
+                            "AO"
+                          )}
+                        </div>
                         <div className="message-content">
                           <div className="message-meta">
-                            <strong>你</strong>
-                            <span>{messageTime(optimisticMessage.time)}</span>
+                            <strong>
+                              {message.role === "assistant"
+                                ? "Kimi"
+                                : message.role === "tool"
+                                  ? (message.toolName ?? "工具")
+                                  : "你"}
+                            </strong>
+                            <span>{messageTime(message.time)}</span>
+                            {message.streaming && <em>处理中</em>}
                           </div>
-                          <MarkdownMessage text={optimisticMessage.text} />
+                          {message.role === "tool" ? (
+                            <ToolMessage message={message} />
+                          ) : (
+                            <MarkdownMessage text={message.text} />
+                          )}
+                          {message.role !== "tool" && (
+                            <div className="message-actions">
+                              <CopyButton text={message.text} />
+                            </div>
+                          )}
+                          {message.streaming && (
+                            <div className="working-line">
+                              <i />
+                              <i />
+                              <i />
+                            </div>
+                          )}
                         </div>
                       </article>
+                    ))
+                  )}
+                  <div
+                    ref={bottomAnchorRef}
+                    className="conversation-bottom-anchor"
+                    aria-hidden="true"
+                  />
+                </div>
+                {!followingBottom && (
+                  <button
+                    type="button"
+                    className="return-bottom-button"
+                    onClick={returnToConversationBottom}
+                  >
+                    ↓ 回到底部
+                    {unreadWhileScrolled > 0 && (
+                      <span>
+                        {unreadWhileScrolled > 99 ? "99+" : unreadWhileScrolled}
+                      </span>
                     )}
-                  </>
-                ) : (
-                  conversationMessages.map((message) => (
-                    <article
-                      key={message.id}
-                      className={`message ${message.role} ${message.isError ? "error" : ""}`}
-                    >
-                      <div className="message-avatar">
-                        {message.role === "assistant" ? (
-                          <Sparkles size={17} />
-                        ) : message.role === "tool" ? (
-                          <Command size={16} />
-                        ) : (
-                          "AO"
-                        )}
-                      </div>
-                      <div className="message-content">
-                        <div className="message-meta">
-                          <strong>
-                            {message.role === "assistant"
-                              ? "Kimi"
-                              : message.role === "tool"
-                                ? (message.toolName ?? "工具")
-                                : "你"}
-                          </strong>
-                          <span>{messageTime(message.time)}</span>
-                          {message.streaming && <em>处理中</em>}
-                        </div>
-                        {message.role === "tool" ? (
-                          <ToolMessage message={message} />
-                        ) : (
-                          <MarkdownMessage text={message.text} />
-                        )}
-                        {message.streaming && (
-                          <div className="working-line">
-                            <i />
-                            <i />
-                            <i />
-                          </div>
-                        )}
-                      </div>
-                    </article>
-                  ))
+                  </button>
                 )}
-              </div>
+              </>
             )}
             <InteractionCards
               approvals={approvals}
@@ -2489,7 +3505,8 @@ export default function App() {
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={(event) => {
                   event.preventDefault();
-                  addAttachments(event.dataTransfer.files);
+                  if (canUseComposerAttachments)
+                    addAttachments(event.dataTransfer.files);
                 }}
               >
                 {promptQueue.length > 0 && (
@@ -2497,22 +3514,42 @@ export default function App() {
                     {promptQueue.map((item) => {
                       const promptId = String(item.promptId ?? "");
                       const state = String(item.status ?? "queued");
+                      const actionState = promptActions[promptId] ?? "idle";
+                      const actionBusyState =
+                        actionState === "applying" ||
+                        actionState === "pending-confirmation";
                       return (
                         <div key={promptId}>
                           <span>
-                            {state === "running" ? "正在执行" : "排队消息"}
+                            {actionState === "applying"
+                              ? "正在操作"
+                              : actionState === "pending-confirmation"
+                                ? "等待确认"
+                                : actionState === "confirmed"
+                                  ? "已确认"
+                                  : actionState === "failed"
+                                    ? "操作失败"
+                                    : state === "running"
+                                      ? "正在执行"
+                                      : "排队消息"}
                           </span>
                           <code>{promptId.slice(0, 8)}</code>
                           {state === "queued" && (
                             <button
+                              type="button"
+                              disabled={actionBusyState}
                               onClick={() =>
                                 void controlPrompt(promptId, "steer")
                               }
                             >
-                              注入当前执行
+                              {actionState === "failed"
+                                ? "重试注入"
+                                : "注入当前执行"}
                             </button>
                           )}
                           <button
+                            type="button"
+                            disabled={actionBusyState}
                             onClick={() =>
                               void controlPrompt(promptId, "abort")
                             }
@@ -2571,7 +3608,8 @@ export default function App() {
                   }}
                   onPaste={(event) => {
                     const files = Array.from(event.clipboardData.files);
-                    if (files.length) addAttachments(files);
+                    if (files.length && canUseComposerAttachments)
+                      addAttachments(files);
                   }}
                   onKeyDown={(event) => {
                     if (mentionQuery(prompt) !== null) {
@@ -2657,13 +3695,15 @@ export default function App() {
                     }
                   }}
                   placeholder={
-                    host?.state !== "online"
-                      ? "主机不可用"
-                      : !channel
-                        ? "等待代理启动"
-                        : `向 ${host?.displayName ?? "所选主机"} 上的 Kimi 发送消息`
+                    !session
+                      ? "请选择会话"
+                      : host?.state !== "online"
+                        ? "等待主机恢复，草稿会保留"
+                        : !channel
+                          ? "等待代理启动，草稿会保留"
+                          : `向 ${host?.displayName ?? "所选主机"} 上的 Kimi 发送消息`
                   }
-                  disabled={host?.state !== "online" || !channel}
+                  disabled={!session}
                   rows={2}
                 />
                 <div className="composer-footer">
@@ -2683,6 +3723,7 @@ export default function App() {
                     <button
                       type="button"
                       title="添加文件、图片或视频"
+                      disabled={!canUseComposerAttachments}
                       onClick={() => attachmentInput.current?.click()}
                     >
                       <Paperclip size={15} /> 附件
@@ -2768,11 +3809,15 @@ export default function App() {
                       <Command size={15} /> 命令
                     </button>
                     <span>
-                      {session.permissionMode === "yolo"
-                        ? "YOLO 自动批准常规工具"
-                        : session.permissionMode === "auto"
-                          ? "自动批准安全工具"
-                          : "工具操作需要批准"}
+                      {host?.state !== "online"
+                        ? "等待主机恢复，草稿会保留"
+                        : !channel
+                          ? "等待代理启动"
+                          : session.permissionMode === "yolo"
+                            ? "YOLO 自动批准常规工具"
+                            : session.permissionMode === "auto"
+                              ? "自动批准安全工具"
+                              : "工具操作需要批准"}
                     </span>
                   </div>
                   <button
@@ -2795,6 +3840,25 @@ export default function App() {
               </p>
             </div>
           </>
+        )}
+
+        {view === "archive" && host && (
+          <ArchiveManager
+            sessions={archivedSessions}
+            loading={archiveLoading}
+            unavailable={!channel || host.state !== "online"}
+            busy={actionBusy}
+            query={archiveQuery}
+            onQueryChange={setArchiveQuery}
+            onRestore={(target) => void restoreSession(target)}
+          />
+        )}
+        {view === "archive" && !host && (
+          <div className="offline-state" role="status">
+            <Archive size={28} />
+            <h2>请选择执行主机</h2>
+            <p>配对并选中主机后，这里会显示可恢复的归档对话</p>
+          </div>
         )}
 
         {view === "terminal" && host && (
@@ -2823,9 +3887,11 @@ export default function App() {
               hostId={host.hostId}
               channel={terminalChannel}
               demo={demo}
+              theme={theme}
               platform={host.platform}
               elevationAvailable={host.capabilities.includes("elevation")}
               elevated={elevated}
+              connectionState={terminalPhase}
               output={terminalOutput}
               onElevatedChange={(next) => void changeElevation(next)}
             />
@@ -2993,7 +4059,15 @@ export default function App() {
               </dl>
               <div className="capability-list">
                 {host.capabilities.map((capability) => (
-                  <span key={capability}>{capability}</span>
+                  <span
+                    key={capability}
+                    tabIndex={0}
+                    title={
+                      capabilityDescriptions[capability] ?? "目标主机支持的能力"
+                    }
+                  >
+                    {capabilityLabel(capability)}
+                  </span>
                 ))}
               </div>
             </section>
@@ -3001,9 +4075,29 @@ export default function App() {
         )}
       </main>
 
-      {rightPanel && view === "conversation" && session && (
+      {rightPanel && (
         <ActivityPanel
           status={sessionStatus}
+          loading={
+            sessionsPhase === "loading" || sessionsPhase === "reconnecting"
+          }
+          state={
+            !host
+              ? "empty"
+              : host.state === "offline"
+                ? "offline"
+                : sessionsPhase === "loading"
+                  ? "loading"
+                  : sessionsPhase === "reconnecting" || !channel
+                    ? "reconnecting"
+                    : sessionsPhase === "error"
+                      ? "error"
+                      : session
+                        ? "ready"
+                        : "empty"
+          }
+          view={view}
+          hostName={host?.displayName}
           sequence={lastSequence}
           tasks={tasks}
           files={files}
@@ -3018,7 +4112,11 @@ export default function App() {
         <NewSessionDialog
           platform={host.platform}
           defaultPermissionMode={newSessionDefault}
+          recentWorkspaces={workspaceOptions}
+          workspaceMissing={workspaceMissing}
+          submitting={actionBusy}
           onCreate={createSession}
+          onEnsureWorkspace={ensureWorkspaceAndRetry}
           onClose={() => setNewSessionOpen(false)}
         />
       )}

@@ -8,10 +8,12 @@ interface TerminalPanelProps {
   hostId: string;
   channel: RelayChannel | null;
   demo: boolean;
+  theme: "light" | "dark";
   platform: "windows" | "linux";
   elevationAvailable: boolean;
   elevated: boolean;
   output: { id: number; data: string } | null;
+  connectionState?: TerminalConnectionState;
   onElevatedChange(value: boolean): void;
 }
 
@@ -21,6 +23,12 @@ interface TerminalResumeState {
 }
 
 type TerminalShell = "powershell" | "cmd" | "shell";
+type TerminalConnectionState =
+  | "loading"
+  | "ready"
+  | "reconnecting"
+  | "offline"
+  | "error";
 
 export function defaultShellForPlatform(
   platform: "windows" | "linux",
@@ -39,14 +47,32 @@ export function effectiveShellForPlatform(
     : "shell";
 }
 
+function terminalTheme(theme: "light" | "dark") {
+  return theme === "light"
+    ? {
+        background: "#f7f7f7",
+        foreground: "#171717",
+        cursor: "#171717",
+        selectionBackground: "#cfcfcf",
+      }
+    : {
+        background: "#0d0d0d",
+        foreground: "#ededed",
+        cursor: "#f2f2f2",
+        selectionBackground: "#414141",
+      };
+}
+
 export function TerminalPanel({
   hostId,
   channel,
   demo,
+  theme,
   platform,
   elevationAvailable,
   elevated,
   output,
+  connectionState = demo ? "ready" : channel ? "ready" : "loading",
   onElevatedChange,
 }: TerminalPanelProps) {
   const container = useRef<HTMLDivElement>(null);
@@ -73,12 +99,7 @@ export function TerminalPanel({
       convertEol: true,
       fontFamily: '"Berkeley Mono", "Cascadia Code", Consolas, monospace',
       fontSize: 13,
-      theme: {
-        background: "#0d0d0d",
-        foreground: "#ededed",
-        cursor: "#f2f2f2",
-        selectionBackground: "#414141",
-      },
+      theme: terminalTheme(theme),
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
@@ -197,6 +218,16 @@ export function TerminalPanel({
   ]);
 
   useEffect(() => {
+    if (activeTerminal.current)
+      activeTerminal.current.options.theme = terminalTheme(theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const textarea = activeTerminal.current?.textarea;
+    if (textarea) textarea.readOnly = !demo && connectionState !== "ready";
+  }, [connectionState, demo]);
+
+  useEffect(() => {
     if (output) activeTerminal.current?.write(output.data);
   }, [output]);
 
@@ -234,7 +265,10 @@ export function TerminalPanel({
   }
 
   return (
-    <section className="terminal-panel" aria-label="主机终端">
+    <section
+      className={`terminal-panel terminal-${theme}`}
+      aria-label="主机终端"
+    >
       <div className="terminal-toolbar">
         <div className="terminal-dots" aria-hidden="true">
           <i />
@@ -266,9 +300,15 @@ export function TerminalPanel({
           </label>
         ) : (
           <span className="terminal-capability-note">
-            {channel || demo
-              ? "普通终端已连接 · 管理员终端未启用"
-              : "正在连接普通终端"}
+            {connectionState === "offline"
+              ? "主机离线 · 等待恢复"
+              : connectionState === "reconnecting"
+                ? "正在重连普通终端"
+                : connectionState === "error"
+                  ? "普通终端连接失败"
+                  : connectionState === "loading"
+                    ? "正在连接普通终端"
+                    : "普通终端已连接 · 管理员终端未启用"}
           </span>
         )}
         {elevated && <span className="danger-chip">断开即终止</span>}

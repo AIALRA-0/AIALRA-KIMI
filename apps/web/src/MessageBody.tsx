@@ -1,8 +1,54 @@
-import { Check, ChevronRight, CircleAlert, LoaderCircle } from "lucide-react";
+import {
+  Check,
+  ChevronRight,
+  CircleAlert,
+  Clipboard,
+  LoaderCircle,
+  RotateCcw,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { UiMessage } from "./session-model.js";
+
+export function CopyButton({ text }: { text: string }) {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+
+  async function copy() {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setState("copied");
+      window.setTimeout(() => setState("idle"), 1600);
+    } catch {
+      setState("failed");
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className={`copy-button ${state}`}
+      onClick={() => void copy()}
+      aria-label={state === "copied" ? "已复制" : "复制内容"}
+      title={state === "failed" ? "复制失败，点击重试" : "复制"}
+    >
+      {state === "copied" ? (
+        <>
+          <Check size={13} /> 已复制
+        </>
+      ) : state === "failed" ? (
+        <>
+          <RotateCcw size={13} /> 重试
+        </>
+      ) : (
+        <>
+          <Clipboard size={13} /> 复制
+        </>
+      )}
+    </button>
+  );
+}
 
 export function MarkdownMessage({ text }: { text: string }) {
   return (
@@ -73,7 +119,10 @@ export function ToolMessage({ message }: { message: UiMessage }) {
       <div className="tool-card-body">
         {message.toolInput && (
           <section>
-            <h4>输入</h4>
+            <div className="tool-card-section-head">
+              <h4>输入</h4>
+              <CopyButton text={message.toolInput} />
+            </div>
             <pre>
               <code>{message.toolInput}</code>
             </pre>
@@ -81,7 +130,10 @@ export function ToolMessage({ message }: { message: UiMessage }) {
         )}
         {message.toolOutput && (
           <section>
-            <h4>结果</h4>
+            <div className="tool-card-section-head">
+              <h4>结果</h4>
+              <CopyButton text={message.toolOutput} />
+            </div>
             <pre>
               <code>{message.toolOutput}</code>
             </pre>

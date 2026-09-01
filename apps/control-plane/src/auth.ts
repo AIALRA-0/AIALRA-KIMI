@@ -41,6 +41,17 @@ export function safeReturnPath(value: string, publicOrigin: URL): string {
   }
 }
 
+function authenticationFailure(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  status: number,
+) {
+  return reply.code(status).send({
+    error: "authentication_failed",
+    requestId: request.id,
+  });
+}
+
 export class AuthService {
   private discovery: Promise<oidc.Configuration> | null = null;
   private elevationDiscovery: Promise<oidc.Configuration> | null = null;
@@ -173,42 +184,43 @@ export class AuthService {
       if (this.config.devAuthBypass && this.config.nodeEnv !== "production") {
         return reply.redirect("/");
       }
-      if (!this.config.oidc)
-        return reply.code(503).send({ error: "oidc_not_configured" });
-      const provider = await this.provider();
-      const verifier = oidc.randomPKCECodeVerifier();
-      const state = oidc.randomState();
-      const returnTo = this.safeReturnTo(
-        typeof request.query === "object" &&
-          request.query &&
-          "returnTo" in request.query
-          ? String(request.query.returnTo)
-          : "/",
-      );
-      const transaction = await new EncryptJWT({ state, verifier, returnTo })
-        .setProtectedHeader({ alg: "dir", enc: "A256GCM" })
-        .setIssuedAt()
-        .setExpirationTime("10m")
-        .encrypt(this.config.sessionKey);
-      reply.setCookie(OIDC_COOKIE, transaction, this.cookieOptions(600));
-      const url = oidc.buildAuthorizationUrl(provider, {
-        redirect_uri: this.config.oidc.redirectUri.href,
-        scope: "openid profile email groups",
-        code_challenge: await oidc.calculatePKCECodeChallenge(verifier),
-        code_challenge_method: "S256",
-        state,
-        prompt: "login",
-        max_age: "0",
-      });
-      return reply.redirect(url.href);
+      if (!this.config.oidc) return authenticationFailure(request, reply, 503);
+      try {
+        const provider = await this.provider();
+        const verifier = oidc.randomPKCECodeVerifier();
+        const state = oidc.randomState();
+        const returnTo = this.safeReturnTo(
+          typeof request.query === "object" &&
+            request.query &&
+            "returnTo" in request.query
+            ? String(request.query.returnTo)
+            : "/",
+        );
+        const transaction = await new EncryptJWT({ state, verifier, returnTo })
+          .setProtectedHeader({ alg: "dir", enc: "A256GCM" })
+          .setIssuedAt()
+          .setExpirationTime("10m")
+          .encrypt(this.config.sessionKey);
+        reply.setCookie(OIDC_COOKIE, transaction, this.cookieOptions(600));
+        const url = oidc.buildAuthorizationUrl(provider, {
+          redirect_uri: this.config.oidc.redirectUri.href,
+          scope: "openid profile email groups",
+          code_challenge: await oidc.calculatePKCECodeChallenge(verifier),
+          code_challenge_method: "S256",
+          state,
+          prompt: "login",
+          max_age: "0",
+        });
+        return reply.redirect(url.href);
+      } catch {
+        return authenticationFailure(request, reply, 503);
+      }
     });
 
     app.get("/auth/callback", async (request, reply) => {
-      if (!this.config.oidc)
-        return reply.code(503).send({ error: "oidc_not_configured" });
+      if (!this.config.oidc) return authenticationFailure(request, reply, 503);
       const encrypted = request.cookies[OIDC_COOKIE];
-      if (!encrypted)
-        return reply.code(400).send({ error: "missing_oidc_transaction" });
+      if (!encrypted) return authenticationFailure(request, reply, 400);
       let transaction: OidcTransaction;
       try {
         const { payload } = await jwtDecrypt(encrypted, this.config.sessionKey);
@@ -218,20 +230,29 @@ export class AuthService {
           returnTo: this.safeReturnTo(String(payload.returnTo)),
         };
       } catch {
-        return reply.code(400).send({ error: "invalid_oidc_transaction" });
+        return authenticationFailure(request, reply, 400);
       }
       const currentUrl = new URL(request.url, this.config.publicOrigin);
-      const tokens = await oidc.authorizationCodeGrant(
-        await this.provider(),
-        currentUrl,
-        {
-          pkceCodeVerifier: transaction.verifier,
-          expectedState: transaction.state,
-        },
-      );
-      const claims = tokens.claims();
-      if (!claims?.sub)
-        return reply.code(401).send({ error: "oidc_subject_missing" });
+      let tokens: Awaited<ReturnType<typeof oidc.authorizationCodeGrant>>;
+      try {
+        tokens = await oidc.authorizationCodeGrant(
+          await this.provider(),
+          currentUrl,
+          {
+            pkceCodeVerifier: transaction.verifier,
+            expectedState: transaction.state,
+          },
+        );
+      } catch {
+        return authenticationFailure(request, reply, 401);
+      }
+      let claims: ReturnType<typeof tokens.claims>;
+      try {
+        claims = tokens.claims();
+      } catch {
+        return authenticationFailure(request, reply, 401);
+      }
+      if (!claims?.sub) return authenticationFailure(request, reply, 401);
       const rawGroups = claims.groups;
       const groups = Array.isArray(rawGroups)
         ? rawGroups.filter(
@@ -241,7 +262,7 @@ export class AuthService {
           ? [rawGroups]
           : [];
       if (!groups.includes(this.config.oidc.ownerGroup)) {
-        return reply.code(403).send({ error: "owner_group_required" });
+        return authenticationFailure(request, reply, 403);
       }
       const name = typeof claims.name === "string" ? claims.name : claims.sub;
       const session = await new SignJWT({ name, groups })
@@ -268,53 +289,56 @@ export class AuthService {
         return reply.redirect("/?elevated=1");
       }
       if (!this.config.elevationOidc) {
-        return reply.code(503).send({ error: "elevation_oidc_not_configured" });
+        return authenticationFailure(request, reply, 503);
       }
-      const verifier = oidc.randomPKCECodeVerifier();
-      const state = oidc.randomState();
-      const returnTo = this.safeReturnTo(
-        typeof request.query === "object" &&
-          request.query &&
-          "returnTo" in request.query
-          ? String(request.query.returnTo)
-          : "/?elevated=1",
-      );
-      const transaction = await new EncryptJWT({
-        state,
-        verifier,
-        returnTo,
-        subject: principal.subject,
-      })
-        .setProtectedHeader({ alg: "dir", enc: "A256GCM" })
-        .setIssuedAt()
-        .setExpirationTime("10m")
-        .encrypt(this.config.sessionKey);
-      reply.setCookie(
-        ELEVATION_OIDC_COOKIE,
-        transaction,
-        this.cookieOptions(600),
-      );
-      const url = oidc.buildAuthorizationUrl(await this.elevationProvider(), {
-        redirect_uri: this.config.elevationOidc.redirectUri.href,
-        scope: "openid profile email groups",
-        code_challenge: await oidc.calculatePKCECodeChallenge(verifier),
-        code_challenge_method: "S256",
-        state,
-        prompt: "login",
-        max_age: "0",
-      });
-      return reply.redirect(url.href);
+      try {
+        const verifier = oidc.randomPKCECodeVerifier();
+        const state = oidc.randomState();
+        const returnTo = this.safeReturnTo(
+          typeof request.query === "object" &&
+            request.query &&
+            "returnTo" in request.query
+            ? String(request.query.returnTo)
+            : "/?elevated=1",
+        );
+        const transaction = await new EncryptJWT({
+          state,
+          verifier,
+          returnTo,
+          subject: principal.subject,
+        })
+          .setProtectedHeader({ alg: "dir", enc: "A256GCM" })
+          .setIssuedAt()
+          .setExpirationTime("10m")
+          .encrypt(this.config.sessionKey);
+        reply.setCookie(
+          ELEVATION_OIDC_COOKIE,
+          transaction,
+          this.cookieOptions(600),
+        );
+        const url = oidc.buildAuthorizationUrl(await this.elevationProvider(), {
+          redirect_uri: this.config.elevationOidc.redirectUri.href,
+          scope: "openid profile email groups",
+          code_challenge: await oidc.calculatePKCECodeChallenge(verifier),
+          code_challenge_method: "S256",
+          state,
+          prompt: "login",
+          max_age: "0",
+        });
+        return reply.redirect(url.href);
+      } catch {
+        return authenticationFailure(request, reply, 503);
+      }
     });
 
     app.get("/auth/elevate/callback", async (request, reply) => {
       const principal = await this.requireOwner(request, reply);
       if (!principal) return;
       if (!this.config.elevationOidc) {
-        return reply.code(503).send({ error: "elevation_oidc_not_configured" });
+        return authenticationFailure(request, reply, 503);
       }
       const encrypted = request.cookies[ELEVATION_OIDC_COOKIE];
-      if (!encrypted)
-        return reply.code(400).send({ error: "missing_elevation_transaction" });
+      if (!encrypted) return authenticationFailure(request, reply, 400);
       let transaction: OidcTransaction;
       try {
         const { payload } = await jwtDecrypt(encrypted, this.config.sessionKey);
@@ -325,23 +349,33 @@ export class AuthService {
           subject: String(payload.subject),
         };
       } catch {
-        return reply.code(400).send({ error: "invalid_elevation_transaction" });
+        return authenticationFailure(request, reply, 400);
       }
       if (transaction.subject !== principal.subject) {
-        return reply.code(403).send({ error: "elevation_subject_mismatch" });
+        return authenticationFailure(request, reply, 403);
       }
       const currentUrl = new URL(request.url, this.config.publicOrigin);
-      const tokens = await oidc.authorizationCodeGrant(
-        await this.elevationProvider(),
-        currentUrl,
-        {
-          pkceCodeVerifier: transaction.verifier,
-          expectedState: transaction.state,
-        },
-      );
-      const claims = tokens.claims();
+      let tokens: Awaited<ReturnType<typeof oidc.authorizationCodeGrant>>;
+      try {
+        tokens = await oidc.authorizationCodeGrant(
+          await this.elevationProvider(),
+          currentUrl,
+          {
+            pkceCodeVerifier: transaction.verifier,
+            expectedState: transaction.state,
+          },
+        );
+      } catch {
+        return authenticationFailure(request, reply, 401);
+      }
+      let claims: ReturnType<typeof tokens.claims>;
+      try {
+        claims = tokens.claims();
+      } catch {
+        return authenticationFailure(request, reply, 401);
+      }
       if (claims?.sub !== principal.subject) {
-        return reply.code(403).send({ error: "elevation_subject_mismatch" });
+        return authenticationFailure(request, reply, 403);
       }
       const elevationGroups = Array.isArray(claims.groups)
         ? claims.groups.filter(
@@ -354,13 +388,13 @@ export class AuthService {
         !this.config.oidc ||
         !elevationGroups.includes(this.config.oidc.ownerGroup)
       ) {
-        return reply.code(403).send({ error: "owner_group_required" });
+        return authenticationFailure(request, reply, 403);
       }
       const authTime =
         typeof claims.auth_time === "number" ? claims.auth_time : null;
       const now = Math.floor(Date.now() / 1000);
       if (authTime === null || Math.abs(now - authTime) > 300) {
-        return reply.code(403).send({ error: "elevation_auth_not_recent" });
+        return authenticationFailure(request, reply, 403);
       }
       const elevation = await new SignJWT({ purpose: "elevation" })
         .setProtectedHeader({ alg: "HS256" })

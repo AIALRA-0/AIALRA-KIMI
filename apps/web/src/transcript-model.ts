@@ -210,9 +210,17 @@ export function applyTranscriptReset(
   page: TranscriptPage,
 ): TranscriptState {
   const next = transcriptFromPage(page);
-  if (!current || current.items.length === 0 || next.items.length > 0)
-    return next;
-  return current;
+  if (!current) return next;
+  // A reset emitted by the live transcript stream intentionally carries no
+  // historical turns; keep the already rendered page while accepting the new
+  // global state and watermark.  Older or duplicate resets must not roll the
+  // cursor back or erase a newer page.
+  if (next.seq > 0 && current.seq > 0 && next.seq < current.seq) return current;
+  if (next.items.length === 0 && current.items.length > 0) {
+    if (next.seq <= current.seq) return current;
+    return { ...next, items: current.items };
+  }
+  return next;
 }
 
 export function mergeTranscriptPage(
@@ -416,8 +424,13 @@ function applyTranscriptOperation(
       state.meta,
       (operation.meta as Record<string, unknown>) ?? {},
     );
+    return { state, gap: false };
   }
-  return { state, gap: false };
+  // Advancing the cursor over an operation we do not understand would make
+  // the next resume permanently incomplete.  Force an authoritative page
+  // reload instead, so new upstream transcript operations cannot be silently
+  // dropped by an older browser.
+  return { state, gap: true };
 }
 
 function cloneState(state: TranscriptState): TranscriptState {

@@ -119,13 +119,27 @@ describe("transcript v2 reducer", () => {
     expect(applyTranscriptOps(state, [], 13).gap).toBe(true);
   });
 
+  it("forces a full recovery for an unknown upstream operation", () => {
+    const state = transcriptFromPage(page());
+    const result = applyTranscriptOps(
+      state,
+      [{ op: "future.operation", value: "not-yet-supported" }],
+      11,
+    );
+    expect(result.gap).toBe(true);
+    expect(result.state).toBe(state);
+  });
+
   it("does not erase a recovered transcript with an empty stale reset", () => {
     const current = transcriptFromPage({ ...page(), seq: 12 });
     const staleReset = { ...page(), items: [], seq: 12 };
     expect(applyTranscriptReset(current, staleReset)).toBe(current);
-    expect(applyTranscriptReset(current, { ...staleReset, seq: 13 })).toBe(
-      current,
-    );
+    const freshReset = applyTranscriptReset(current, {
+      ...staleReset,
+      seq: 13,
+    });
+    expect(freshReset.items).toEqual(current.items);
+    expect(freshReset.seq).toBe(13);
   });
 
   it("keeps an empty recovery page scoped to its session", () => {

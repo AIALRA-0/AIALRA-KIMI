@@ -11,7 +11,7 @@ import {
   UserRound,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { MarkdownMessage } from "./MessageBody.js";
+import { CopyButton, MarkdownMessage } from "./MessageBody.js";
 import { turnTraceDefaultOpen } from "./transcript-model.js";
 import type {
   TranscriptFrame,
@@ -26,6 +26,7 @@ interface TranscriptTimelineProps {
   hostId: string;
   sessionId: string;
   collapseCompleted?: boolean;
+  autoCollapsedTurnIds?: ReadonlySet<string>;
   onLoadOlder?: () => void;
   loadingOlder?: boolean;
 }
@@ -93,69 +94,149 @@ function stateLabel(state: TranscriptTurn["state"]): string {
   return "已完成";
 }
 
+function readManualOpen(storageKey: string): boolean | null {
+  try {
+    const value = sessionStorage.getItem(storageKey);
+    return value === "open" ? true : value === "closed" ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+function useManualOpen(storageKey: string, defaultOpen: boolean) {
+  const [manual, setManual] = useState<boolean | null>(() =>
+    readManualOpen(storageKey),
+  );
+  const open = manual ?? defaultOpen;
+  useEffect(() => {
+    try {
+      if (manual === null) sessionStorage.removeItem(storageKey);
+      else sessionStorage.setItem(storageKey, manual ? "open" : "closed");
+    } catch {
+      // A restricted storage context should not break transcript rendering.
+    }
+  }, [manual, storageKey]);
+  return [open, () => setManual(!open)] as const;
+}
+
+function ThinkingFrame({
+  frame,
+  turnRunning,
+  storageKey,
+}: {
+  frame: Extract<TranscriptFrame, { kind: "thinking" }>;
+  turnRunning: boolean;
+  storageKey: string;
+}) {
+  const [open, toggle] = useManualOpen(storageKey, turnRunning);
+  return (
+    <details className="trace-part thinking-part" open={open}>
+      <summary
+        onClick={(event) => {
+          event.preventDefault();
+          toggle();
+        }}
+      >
+        <ChevronRight size={14} />
+        <Brain size={14} />
+        <strong>思考</strong>
+        <span>{frame.text.length.toLocaleString()} 字符</span>
+      </summary>
+      <div className="trace-part-body">
+        <MarkdownMessage text={frame.text || "正在思考"} />
+      </div>
+    </details>
+  );
+}
+
+function NoticeFrame({
+  frame,
+  storageKey,
+}: {
+  frame: Extract<TranscriptFrame, { kind: "notice" }>;
+  storageKey: string;
+}) {
+  const [open, toggle] = useManualOpen(storageKey, frame.level === "error");
+  return (
+    <details className={`trace-part notice-part ${frame.level}`} open={open}>
+      <summary
+        onClick={(event) => {
+          event.preventDefault();
+          toggle();
+        }}
+      >
+        <ChevronRight size={14} />
+        <CircleAlert size={14} />
+        <strong>
+          {frame.level === "error"
+            ? "错误"
+            : frame.level === "warning"
+              ? "警告"
+              : "提示"}
+        </strong>
+        <span>{frame.message}</span>
+      </summary>
+      {frame.detail !== undefined && (
+        <div className="trace-part-body">
+          <pre>{jsonText(frame.detail)}</pre>
+        </div>
+      )}
+    </details>
+  );
+}
+
 function TraceFrame({
   frame,
   turnRunning,
+  storageKey,
 }: {
   frame: TranscriptFrame;
   turnRunning: boolean;
+  storageKey: string;
 }) {
   if (frame.kind === "text" && frame.role === "assistant") return null;
-  if (frame.kind === "thinking") {
+  if (frame.kind === "thinking")
     return (
-      <details className="trace-part thinking-part" open={turnRunning}>
-        <summary>
-          <ChevronRight size={14} />
-          <Brain size={14} />
-          <strong>思考</strong>
-          <span>{frame.text.length.toLocaleString()} 字符</span>
-        </summary>
-        <div className="trace-part-body">
-          <MarkdownMessage text={frame.text || "正在思考"} />
-        </div>
-      </details>
+      <ThinkingFrame
+        frame={frame}
+        turnRunning={turnRunning}
+        storageKey={storageKey}
+      />
     );
-  }
-  if (frame.kind === "tool") return <ToolFrame frame={frame} />;
-  if (frame.kind === "notice") {
-    return (
-      <details
-        className={`trace-part notice-part ${frame.level}`}
-        open={frame.level === "error"}
-      >
-        <summary>
-          <ChevronRight size={14} />
-          <CircleAlert size={14} />
-          <strong>
-            {frame.level === "error"
-              ? "错误"
-              : frame.level === "warning"
-                ? "警告"
-                : "提示"}
-          </strong>
-          <span>{frame.message}</span>
-        </summary>
-        {frame.detail !== undefined && (
-          <div className="trace-part-body">
-            <pre>{jsonText(frame.detail)}</pre>
-          </div>
-        )}
-      </details>
-    );
-  }
+  if (frame.kind === "tool")
+    return <ToolFrame frame={frame} storageKey={storageKey} />;
+  if (frame.kind === "notice")
+    return <NoticeFrame frame={frame} storageKey={storageKey} />;
   return null;
 }
 
-function ToolFrame({ frame }: { frame: TranscriptToolFrame }) {
+function ToolFrame({
+  frame,
+  storageKey,
+}: {
+  frame: TranscriptToolFrame;
+  storageKey: string;
+}) {
   const running = frame.state === "running";
   const failed = frame.state === "error";
   const Icon = running ? LoaderCircle : failed ? CircleAlert : Check;
+  const [open, toggle] = useManualOpen(storageKey, running || failed);
+  const [inputOpen, toggleInput] = useManualOpen(`${storageKey}:input`, false);
+  const [outputOpen, toggleOutput] = useManualOpen(
+    `${storageKey}:output`,
+    failed,
+  );
   return (
     <details
       className={`trace-part tool-part ${failed ? "error" : ""}`}
-      open={running || failed}
+      open={open}
     >
-      <summary>
+      <summary
+        onClick={(event) => {
+          event.preventDefault();
+          toggle();
+        }}
+      >
         <ChevronRight size={14} />
         <Command size={14} />
         <strong>{frame.name || "工具"}</strong>
@@ -170,25 +251,50 @@ function ToolFrame({ frame }: { frame: TranscriptToolFrame }) {
         {(frame.inputText ||
           frame.input !== undefined ||
           frame.display !== undefined) && (
-          <details>
-            <summary>
+          <details open={inputOpen}>
+            <summary
+              onClick={(event) => {
+                event.preventDefault();
+                toggleInput();
+              }}
+            >
               <ChevronRight size={13} /> 输入
             </summary>
-            <pre>
-              {frame.inputText || jsonText(frame.display ?? frame.input)}
-            </pre>
+            <div className="trace-copy-wrap">
+              <pre>
+                {frame.inputText || jsonText(frame.display ?? frame.input)}
+              </pre>
+              <CopyButton
+                text={frame.inputText || jsonText(frame.display ?? frame.input)}
+              />
+            </div>
           </details>
         )}
         {(frame.output !== undefined ||
           frame.error ||
           frame.progress?.text) && (
-          <details open={failed}>
-            <summary>
+          <details open={outputOpen}>
+            <summary
+              onClick={(event) => {
+                event.preventDefault();
+                toggleOutput();
+              }}
+            >
               <ChevronRight size={13} /> {failed ? "错误" : "结果"}
             </summary>
-            <pre>
-              {frame.error || jsonText(frame.output) || frame.progress?.text}
-            </pre>
+            <div className="trace-copy-wrap">
+              <pre>
+                {frame.error || jsonText(frame.output) || frame.progress?.text}
+              </pre>
+              <CopyButton
+                text={
+                  frame.error ||
+                  jsonText(frame.output) ||
+                  frame.progress?.text ||
+                  ""
+                }
+              />
+            </div>
           </details>
         )}
         {frame.agentRefs && frame.agentRefs.length > 0 && (
@@ -201,7 +307,13 @@ function ToolFrame({ frame }: { frame: TranscriptToolFrame }) {
   );
 }
 
-function StepTrace({ step }: { step: TranscriptStep }) {
+function StepTrace({
+  step,
+  storagePrefix,
+}: {
+  step: TranscriptStep;
+  storagePrefix: string;
+}) {
   const frames = step.frames.filter(
     (frame) => frame.kind !== "text" || frame.role !== "assistant",
   );
@@ -231,6 +343,7 @@ function StepTrace({ step }: { step: TranscriptStep }) {
           key={frame.frameId}
           frame={frame}
           turnRunning={step.state === "running"}
+          storageKey={`${storagePrefix}:frame:${frame.frameId}`}
         />
       ))}
     </div>
@@ -241,31 +354,24 @@ function TurnCard({
   turn,
   latest,
   collapseCompleted,
+  autoCollapsed,
   storageKey,
 }: {
   turn: TranscriptTurn;
   latest: boolean;
   collapseCompleted: boolean;
+  autoCollapsed: boolean;
   storageKey: string;
 }) {
   const running = turn.state === "running" || turn.state === "queued";
   const defaultOpen = turnTraceDefaultOpen(
     turn.state,
     latest,
-    collapseCompleted,
+    collapseCompleted || autoCollapsed,
   );
-  const [manual, setManual] = useState<boolean | null>(() => {
-    const value = sessionStorage.getItem(storageKey);
-    return value === "open" ? true : value === "closed" ? false : null;
-  });
-  const open = manual ?? defaultOpen;
+  const [open, toggle] = useManualOpen(storageKey, defaultOpen);
   const output = assistantText(turn);
   const count = frameCount(turn);
-
-  useEffect(() => {
-    if (manual === null) sessionStorage.removeItem(storageKey);
-    else sessionStorage.setItem(storageKey, manual ? "open" : "closed");
-  }, [manual, storageKey]);
 
   return (
     <article className={`transcript-turn ${running ? "running" : turn.state}`}>
@@ -284,6 +390,9 @@ function TurnCard({
               {turn.attachmentIds.length} 个附件
             </p>
           )}
+          <div className="message-actions">
+            <CopyButton text={turn.prompt || ""} />
+          </div>
         </div>
       </div>
 
@@ -292,7 +401,7 @@ function TurnCard({
           <summary
             onClick={(event) => {
               event.preventDefault();
-              setManual(!open);
+              toggle();
             }}
           >
             <ChevronRight size={15} />
@@ -303,12 +412,16 @@ function TurnCard({
             )}
             <strong>思考与操作</strong>
             <span>{count} 项</span>
-            {formatDuration(turn) && <span>{formatDuration(turn)}</span>}
+            <span className="turn-duration">{formatDuration(turn) || "—"}</span>
             <em>{stateLabel(turn.state)}</em>
           </summary>
           <div className="turn-trace-body">
             {turn.steps.map((step) => (
-              <StepTrace key={step.stepId} step={step} />
+              <StepTrace
+                key={step.stepId}
+                step={step}
+                storagePrefix={`${storageKey}:step:${step.stepId}`}
+              />
             ))}
           </div>
         </details>
@@ -336,6 +449,9 @@ function TurnCard({
                 <i />
               </div>
             )}
+            <div className="message-actions">
+              {output && <CopyButton text={output} />}
+            </div>
           </div>
         </div>
       )}
@@ -348,6 +464,7 @@ export function TranscriptTimeline({
   hostId,
   sessionId,
   collapseCompleted = false,
+  autoCollapsedTurnIds,
   onLoadOlder,
   loadingOlder,
 }: TranscriptTimelineProps) {
@@ -375,6 +492,7 @@ export function TranscriptTimeline({
           turn={turn}
           latest={index === turns.length - 1}
           collapseCompleted={collapseCompleted}
+          autoCollapsed={autoCollapsedTurnIds?.has(turn.turnId) ?? false}
           storageKey={`aialra-fold:${hostId}:${sessionId}:${turn.turnId}`}
         />
       ))}

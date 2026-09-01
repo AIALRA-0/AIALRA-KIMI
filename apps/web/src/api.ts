@@ -22,6 +22,7 @@ export class ApiError extends Error {
 function apiErrorMessage(code: string, status: number): string {
   const messages: Record<string, string> = {
     authentication_required: "登录已失效，请重新登录",
+    authentication_failed: "身份验证失败，请重新登录（可提供请求编号给管理员）",
     owner_group_required: "当前账号不属于所有者组",
     recent_elevation_required: "此操作需要重新验证管理员身份",
     csrf_validation_failed: "安全校验失败，请刷新页面后重试",

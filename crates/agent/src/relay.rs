@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,8 +11,11 @@ use futures_util::{SinkExt, StreamExt};
 use rand::{RngCore, rngs::OsRng};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::task::JoinHandle;
-use tokio::{sync::mpsc, time::MissedTickBehavior};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::{
+    sync::{Mutex, mpsc, watch},
+    time::{MissedTickBehavior, timeout},
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 use url::Url;
@@ -25,7 +29,7 @@ use crate::{
     crypto::{EncryptedFrame, SecureChannel},
     events::{KimiEventController, start as start_kimi_events},
     identity::{HostIdentity, verifying_key_from_pem},
-    kimi::{KimiClient, KimiProbe, KimiRuntime},
+    kimi::{KimiClient, KimiHeartbeat, KimiProbe, KimiRuntime},
     terminal::{TerminalManager, TerminalOutput},
 };
 
@@ -114,7 +118,7 @@ pub async fn enroll(
 
 pub async fn run_forever(config: AgentConfig, identity: HostIdentity) -> Result<()> {
     let (terminal_tx, mut terminal_rx) = mpsc::channel::<TerminalOutput>(256);
-    let mut terminals = TerminalManager::new(terminal_tx);
+    let terminals = Arc::new(Mutex::new(TerminalManager::new(terminal_tx)));
     let mut runtime_backoff = Duration::from_secs(1);
     loop {
         match KimiRuntime::ensure(&config).await {
@@ -135,7 +139,7 @@ pub async fn run_forever(config: AgentConfig, identity: HostIdentity) -> Result<
                         &identity,
                         &kimi,
                         probe,
-                        &mut terminals,
+                        Arc::clone(&terminals),
                         &mut terminal_rx,
                     )
                     .await
@@ -143,16 +147,22 @@ pub async fn run_forever(config: AgentConfig, identity: HostIdentity) -> Result<
                         Ok(()) => relay_backoff = Duration::from_secs(1),
                         Err(error) => warn!(error = %error, "relay connection ended"),
                     }
-                    terminals.disconnect_all_channels();
-                    terminals.reap_expired();
+                    {
+                        let mut terminals = terminals.lock().await;
+                        terminals.disconnect_all_channels();
+                        terminals.reap_expired();
+                    }
                     tokio::time::sleep(relay_backoff).await;
                     relay_backoff = (relay_backoff * 2).min(Duration::from_secs(30));
                 }
             }
             Err(error) => warn!(error = %error, "Kimi server could not be started"),
         }
-        terminals.disconnect_all_channels();
-        terminals.reap_expired();
+        {
+            let mut terminals = terminals.lock().await;
+            terminals.disconnect_all_channels();
+            terminals.reap_expired();
+        }
         tokio::time::sleep(runtime_backoff).await;
         runtime_backoff = (runtime_backoff * 2).min(Duration::from_secs(30));
     }
@@ -163,7 +173,7 @@ async fn run_connection(
     identity: &HostIdentity,
     kimi: &KimiClient,
     probe: KimiProbe,
-    terminals: &mut TerminalManager,
+    terminals: Arc<Mutex<TerminalManager>>,
     terminal_rx: &mut mpsc::Receiver<TerminalOutput>,
 ) -> Result<()> {
     let (socket, _) = connect_async(agent_websocket_url(&config.server_url)?.as_str())
@@ -186,17 +196,60 @@ async fn run_connection(
         .await?;
     let (event_controller, mut kimi_event_rx, event_task) = start_kimi_events(kimi.clone());
     let _event_task = AbortOnDrop(event_task);
-    let mut channels: HashMap<String, SecureChannel> = HashMap::new();
+    let channels = Arc::new(Mutex::new(HashMap::<String, SecureChannel>::new()));
+    let mut browser_tasks = JoinSet::new();
     let grant_verification_key = verifying_key_from_pem(&config.grant_verification_key)?;
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut heartbeat_watchdog = tokio::time::interval(Duration::from_secs(5));
     heartbeat_watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut cache_refresh = tokio::time::interval(Duration::from_secs(60));
-    cache_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut authenticated = false;
     let mut compatible = false;
     let mut last_relay_activity = Instant::now();
+    let (heartbeat_state_tx, heartbeat_state_rx) = watch::channel(false);
+    let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel::<Result<KimiHeartbeat, String>>(4);
+    let heartbeat_client = kimi.clone();
+    let _heartbeat_task = AbortOnDrop(tokio::spawn(async move {
+        let mut heartbeat_state_rx = heartbeat_state_rx;
+        let mut interval = tokio::time::interval(Duration::from_secs(20));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            if !*heartbeat_state_rx.borrow() {
+                if heartbeat_state_rx.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            interval.tick().await;
+            let result = match timeout(Duration::from_secs(10), heartbeat_client.heartbeat()).await
+            {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("Kimi heartbeat timed out".to_owned()),
+            };
+            if heartbeat_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    }));
+    let (cache_state_tx, mut cache_state_rx) = watch::channel(false);
+    let cache_outgoing = outgoing_tx.clone();
+    let cache_config = config.clone();
+    let cache_kimi = kimi.clone();
+    let _cache_task = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            if !*cache_state_rx.borrow() {
+                if cache_state_rx.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            if let Err(error) =
+                send_session_cache(&cache_outgoing, &cache_config, &cache_kimi).await
+            {
+                warn!(error = %error, "failed to refresh the redacted session cache");
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }));
 
     loop {
         tokio::select! {
@@ -218,19 +271,22 @@ async fn run_connection(
                         match kind {
                             "server.hello" => {
                                 authenticated = true;
+                                let _ = heartbeat_state_tx.send(true);
                                 compatible = value.get("compatible").and_then(Value::as_bool) == Some(true);
                                 if compatible {
                                     info!(host_id = %config.host_id, "agent relay authenticated");
-                                    if let Err(error) = send_session_cache(&outgoing_tx, config, kimi).await {
-                                        warn!(error = %error, "failed to refresh the redacted session cache");
-                                    }
+                                    let _ = cache_state_tx.send(true);
                                 } else {
                                     warn!(host_id = %config.host_id, "Kimi protocol is unsupported; control operations remain blocked");
                                 }
                             }
                             "browser.channel.open" if authenticated && compatible => {
                                 let channel_id = string(&value, "channelId")?;
-                                if !channel_capacity_allows(channels.len(), channels.contains_key(channel_id)) {
+                                let channel_capacity = {
+                                    let channels = channels.lock().await;
+                                    channel_capacity_allows(channels.len(), channels.contains_key(channel_id))
+                                };
+                                if !channel_capacity {
                                     outgoing_tx.send(json!({
                                         "type": "agent.error",
                                         "requestId": value.get("requestId"),
@@ -270,38 +326,60 @@ async fn run_connection(
                                     "agentEphemeralKey": accepted.agent_ephemeral_key,
                                     "signature": accepted.signature
                                 })).await?;
-                                channels.insert(channel_id.to_owned(), accepted.channel);
+                                channels
+                                    .lock()
+                                    .await
+                                    .insert(channel_id.to_owned(), accepted.channel);
                             }
                             "browser.frame" if authenticated && compatible => {
-                                if let Err(error) = process_browser_frame(
-                                    &value,
-                                    config,
-                                    kimi,
-                                    &mut channels,
-                                    terminals,
-                                    &event_controller,
-                                    &outgoing_tx,
-                                ).await {
-                                    warn!(error = %error, "rejected an encrypted browser frame");
-                                    if let Some(channel_id) = value.pointer("/frame/channelId").and_then(Value::as_str) {
-                                        terminals.disconnect_channel(channel_id);
-                                        let _ = event_controller.unsubscribe_channel(channel_id.to_owned()).await;
-                                        channels.remove(channel_id);
+                                match prepare_browser_frame(&value, &channels).await {
+                                    Ok(prepared) => {
+                                        let config = config.clone();
+                                        let kimi = kimi.clone();
+                                        let channels = Arc::clone(&channels);
+                                        let terminals = Arc::clone(&terminals);
+                                        let events = event_controller.clone();
+                                        let outgoing = outgoing_tx.clone();
+                                        browser_tasks.spawn(async move {
+                                            handle_browser_request(
+                                                prepared,
+                                                &config,
+                                                &kimi,
+                                                channels,
+                                                terminals,
+                                                &events,
+                                                &outgoing,
+                                            )
+                                            .await;
+                                        });
                                     }
-                                    outgoing_tx.send(json!({
-                                        "type": "agent.error",
-                                        "requestId": Value::Null,
-                                        "hostId": config.host_id,
-                                        "code": "channel_frame_rejected",
-                                        "message": "encrypted channel frame was rejected"
-                                    })).await?;
+                                    Err(error) => {
+                                        warn!(error = %error, "rejected an encrypted browser frame");
+                                        if let Some(channel_id) = value
+                                            .pointer("/frame/channelId")
+                                            .and_then(Value::as_str)
+                                        {
+                                            terminals.lock().await.disconnect_channel(channel_id);
+                                            let _ = event_controller
+                                                .unsubscribe_channel(channel_id.to_owned())
+                                                .await;
+                                            channels.lock().await.remove(channel_id);
+                                        }
+                                        outgoing_tx.send(json!({
+                                            "type": "agent.error",
+                                            "requestId": Value::Null,
+                                            "hostId": config.host_id,
+                                            "code": "channel_frame_rejected",
+                                            "message": "encrypted channel frame was rejected"
+                                        })).await?;
+                                    }
                                 }
                             }
                             "browser.channel.close" if authenticated && compatible => {
                                 let channel_id = string(&value, "channelId")?;
-                                terminals.disconnect_channel(channel_id);
+                                terminals.lock().await.disconnect_channel(channel_id);
                                 let _ = event_controller.unsubscribe_channel(channel_id.to_owned()).await;
-                                channels.remove(channel_id);
+                                channels.lock().await.remove(channel_id);
                             }
                             "server.heartbeat" => {}
                             "server.error" => warn!(code = ?value.get("code"), "control plane reported a relay error"),
@@ -314,27 +392,44 @@ async fn run_connection(
                 }
             }
             output = terminal_rx.recv() => {
-                if let Some(output) = output
-                    && let Some(channel_id) = terminals.route_output(&output)
-                    && let Some(channel) = channels.get_mut(&channel_id) {
-                    let frame = channel.encrypt(&json!({ "event": {
-                        "type": "terminal.output",
-                        "terminalId": output.terminal_id,
-                        "data": output.data
-                    }}))?;
-                    outgoing_tx.send(json!({ "type": "agent.frame", "hostId": config.host_id, "frame": frame })).await?;
+                if let Some(output) = output {
+                    let channel_id = terminals.lock().await.route_output(&output);
+                    if let Some(channel_id) = channel_id {
+                        let frame = channels
+                            .lock()
+                            .await
+                            .get_mut(&channel_id)
+                            .map(|channel| channel.encrypt(&json!({ "event": {
+                                "type": "terminal.output",
+                                "terminalId": output.terminal_id,
+                                "data": output.data
+                            }})))
+                            .transpose()?;
+                        if let Some(frame) = frame {
+                            outgoing_tx.send(json!({ "type": "agent.frame", "hostId": config.host_id, "frame": frame })).await?;
+                        }
+                    }
                 }
             }
             event = kimi_event_rx.recv() => {
-                if let Some(event) = event
-                    && let Some(channel) = channels.get_mut(&event.channel_id) {
-                    let frame = channel.encrypt(&json!({ "event": event.value }))?;
-                    outgoing_tx.send(json!({ "type": "agent.frame", "hostId": config.host_id, "frame": frame })).await?;
+                if let Some(event) = event {
+                    let frame = channels
+                        .lock()
+                        .await
+                        .get_mut(&event.channel_id)
+                        .map(|channel| channel.encrypt(&json!({ "event": event.value })))
+                        .transpose()?;
+                    if let Some(frame) = frame {
+                        outgoing_tx.send(json!({ "type": "agent.frame", "hostId": config.host_id, "frame": frame })).await?;
+                    }
                 }
             }
-            _ = heartbeat.tick(), if authenticated => {
-                terminals.reap_expired();
-                match kimi.heartbeat().await {
+            heartbeat_result = heartbeat_rx.recv() => {
+                let Some(result) = heartbeat_result else {
+                    bail!("Kimi heartbeat worker ended unexpectedly");
+                };
+                terminals.lock().await.reap_expired();
+                match result {
                     Ok(status) => {
                         outgoing_tx.send(json!({
                             "type": "agent.heartbeat",
@@ -364,9 +459,9 @@ async fn run_connection(
                     bail!("relay heartbeat acknowledgement timed out");
                 }
             }
-            _ = cache_refresh.tick(), if authenticated && compatible => {
-                if let Err(error) = send_session_cache(&outgoing_tx, config, kimi).await {
-                    warn!(error = %error, "failed to refresh the redacted session cache");
+            browser_task = browser_tasks.join_next(), if !browser_tasks.is_empty() => {
+                if let Some(Err(error)) = browser_task {
+                    warn!(error = %error, "browser operation worker failed");
                 }
             }
         }
@@ -379,28 +474,89 @@ fn relay_silence_exceeded(elapsed: Duration) -> bool {
     elapsed > MAX_RELAY_SILENCE
 }
 
-async fn process_browser_frame(
+struct PreparedBrowserRequest {
+    channel_id: String,
+    request: Value,
+}
+
+async fn prepare_browser_frame(
     envelope: &Value,
-    config: &AgentConfig,
-    kimi: &KimiClient,
-    channels: &mut HashMap<String, SecureChannel>,
-    terminals: &mut TerminalManager,
-    events: &KimiEventController,
-    outgoing: &mpsc::Sender<Value>,
-) -> Result<()> {
+    channels: &Arc<Mutex<HashMap<String, SecureChannel>>>,
+) -> Result<PreparedBrowserRequest> {
     let frame: EncryptedFrame = serde_json::from_value(
         envelope
             .get("frame")
             .cloned()
             .context("relay frame omitted ciphertext")?,
     )?;
+    let mut channels = channels.lock().await;
     let channel = channels
         .get_mut(&frame.channel_id)
         .context("unknown encrypted channel")?;
     if envelope.get("grant").and_then(Value::as_str) != Some(channel.grant_token.as_str()) {
         bail!("encrypted channel grant changed after opening");
     }
-    let mut request = channel.decrypt(&frame)?;
+    let request = channel.decrypt(&frame)?;
+    let operation = string(&request, "operation")?;
+    if !channel.allows(operation) {
+        bail!("operation is outside the capability grant");
+    }
+    Ok(PreparedBrowserRequest {
+        channel_id: frame.channel_id,
+        request,
+    })
+}
+
+async fn handle_browser_request(
+    prepared: PreparedBrowserRequest,
+    config: &AgentConfig,
+    kimi: &KimiClient,
+    channels: Arc<Mutex<HashMap<String, SecureChannel>>>,
+    terminals: Arc<Mutex<TerminalManager>>,
+    events: &KimiEventController,
+    outgoing: &mpsc::Sender<Value>,
+) {
+    let channel_id = prepared.channel_id.clone();
+    if let Err(error) = process_browser_request(
+        prepared,
+        config,
+        kimi,
+        channels.clone(),
+        terminals.clone(),
+        events,
+        outgoing,
+    )
+    .await
+    {
+        warn!(error = %error, "rejected an encrypted browser frame");
+        terminals.lock().await.disconnect_channel(&channel_id);
+        let _ = events.unsubscribe_channel(channel_id.clone()).await;
+        channels.lock().await.remove(&channel_id);
+        let _ = outgoing
+            .send(json!({
+                "type": "agent.error",
+                "requestId": Value::Null,
+                "hostId": config.host_id,
+                "code": "channel_frame_rejected",
+                "message": "encrypted channel frame was rejected"
+            }))
+            .await;
+    }
+}
+
+async fn process_browser_request(
+    prepared: PreparedBrowserRequest,
+    config: &AgentConfig,
+    kimi: &KimiClient,
+    channels: Arc<Mutex<HashMap<String, SecureChannel>>>,
+    terminals: Arc<Mutex<TerminalManager>>,
+    events: &KimiEventController,
+    outgoing: &mpsc::Sender<Value>,
+) -> Result<()> {
+    let PreparedBrowserRequest {
+        channel_id,
+        mut request,
+    } = prepared;
     let request_id = string(&request, "requestId")?.to_owned();
     let operation = string(&request, "operation")?.to_owned();
     let mut body = request
@@ -411,10 +567,6 @@ async fn process_browser_frame(
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if !channel.allows(&operation) {
-        bail!("operation is outside the capability grant");
-    }
-    let channel_id = channel.id.clone();
     if audited_operation(&operation) {
         outgoing
             .send(json!({
@@ -429,12 +581,14 @@ async fn process_browser_frame(
             .await?;
     }
     let result = match operation.as_str() {
-        "terminal.open" => terminals.open(&channel_id, &mut body, false),
-        "terminal.resume" => terminals.resume(&channel_id, &body),
-        "terminal.elevate.open" => terminals.open(&channel_id, &mut body, true),
-        "terminal.input" | "terminal.elevate.input" => terminals.input(&channel_id, &body),
-        "terminal.resize" => terminals.resize(&channel_id, &body),
-        "terminal.close" => terminals.close_channel(&channel_id),
+        "terminal.open" => terminals.lock().await.open(&channel_id, &mut body, false),
+        "terminal.resume" => terminals.lock().await.resume(&channel_id, &body),
+        "terminal.elevate.open" => terminals.lock().await.open(&channel_id, &mut body, true),
+        "terminal.input" | "terminal.elevate.input" => {
+            terminals.lock().await.input(&channel_id, &body)
+        }
+        "terminal.resize" => terminals.lock().await.resize(&channel_id, &body),
+        "terminal.close" => terminals.lock().await.close_channel(&channel_id),
         _ => kimi.operation(&config.host_id, &operation, body).await,
     };
     let succeeded = result.is_ok();
@@ -445,6 +599,7 @@ async fn process_browser_frame(
                 | "sessions.events"
                 | "sessions.transcript.read"
                 | "sessions.transcript.resume"
+                | "sessions.transcript.subscribe"
         )
         && let Some(session_id) = subscribe_session
     {
@@ -487,6 +642,8 @@ async fn process_browser_frame(
         Err(error) => json!({ "requestId": request_id, "ok": false, "error": error.to_string() }),
     };
     let encrypted = channels
+        .lock()
+        .await
         .get_mut(&channel_id)
         .context("encrypted channel closed during operation")?
         .encrypt(&response)?;
@@ -519,13 +676,17 @@ fn audited_operation(operation: &str) -> bool {
         operation,
         "sessions.create"
             | "sessions.archive"
+            | "sessions.restore"
             | "sessions.fork"
             | "sessions.prompt"
+            | "sessions.prompts.steer"
+            | "sessions.prompts.abort"
             | "sessions.interrupt"
             | "sessions.approvals.respond"
             | "sessions.questions.respond"
             | "sessions.questions.dismiss"
             | "sessions.permission.write"
+            | "workspaces.ensure"
             | "oauth.device.start"
             | "terminal.open"
             | "terminal.close"

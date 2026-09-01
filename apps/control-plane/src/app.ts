@@ -280,13 +280,38 @@ export async function createApp(config: AppConfig): Promise<AppServices> {
     return reply.code(204).send();
   });
 
+  // `@fastify/static` serves explicit files before the SPA fallback.  Keep the
+  // generated shell behind the same authentication boundary as `/`, otherwise
+  // an anonymous request to `/index.html` could still reveal the private app
+  // shell and its release metadata.
+  app.addHook("onRequest", async (request, reply) => {
+    if (config.nodeEnv !== "production") return;
+    const pathname = new URL(request.url, config.publicOrigin).pathname;
+    if (pathname !== "/index.html" || (await auth.principal(request))) return;
+    const current = new URL(request.url, config.publicOrigin);
+    const returnTo = `${current.pathname}${current.search}${current.hash}`;
+    return reply.redirect(
+      `/auth/login?returnTo=${encodeURIComponent(returnTo)}`,
+    );
+  });
+
   if (existsSync(config.webDistPath)) {
     await app.register(fastifyStatic, {
       root: config.webDistPath,
       wildcard: false,
+      // The SPA shell must pass through the authenticated fallback below;
+      // static assets can still be served directly by this plugin.
+      index: false,
     });
-    app.get("/*", async (_request, reply) => {
+    app.get("/*", async (request, reply) => {
       reply.header("Cache-Control", "no-store");
+      if (config.nodeEnv === "production" && !(await auth.principal(request))) {
+        const current = new URL(request.url, config.publicOrigin);
+        const returnTo = `${current.pathname}${current.search}${current.hash}`;
+        return reply.redirect(
+          `/auth/login?returnTo=${encodeURIComponent(returnTo)}`,
+        );
+      }
       return reply
         .type("text/html")
         .send(readFileSync(join(config.webDistPath, "index.html")));

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -125,7 +125,6 @@ async fn event_loop(
             drain_commands(&mut commands, &mut subscriptions, &mut cursors);
             continue;
         };
-        backoff = Duration::from_secs(1);
         let (mut sink, mut stream) = socket.split();
         if sink
             .send(Message::Text(
@@ -137,8 +136,15 @@ async fn event_loop(
                 .await
                 .is_err()
         {
+            // A WebSocket can accept the TCP handshake and still reject the
+            // protocol hello while Kimi is starting.  Treat that as a
+            // reconnectable failure instead of spinning a tight loop.
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(15));
+            drain_commands(&mut commands, &mut subscriptions, &mut cursors);
             continue;
         }
+        let connected_at = Instant::now();
         loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -246,6 +252,16 @@ async fn event_loop(
                 }
             }
         }
+        // A socket that closes immediately after accepting the protocol must
+        // not create a tight reconnect loop while Kimi is still starting.
+        // Reset the delay only after a connection stayed healthy briefly,
+        // then apply the same capped exponential backoff as connection errors.
+        if connected_at.elapsed() >= Duration::from_secs(5) {
+            backoff = Duration::from_secs(1);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(15));
+        drain_commands(&mut commands, &mut subscriptions, &mut cursors);
     }
 }
 

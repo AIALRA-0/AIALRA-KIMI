@@ -52,6 +52,7 @@ interface ChannelState {
   grant: string;
   identityKey: Uint8Array;
   key: Uint8Array | null;
+  closed: boolean;
   sequence: number;
   ready: Promise<void>;
   resolveReady(): void;
@@ -68,6 +69,15 @@ interface RpcReply {
   ok: boolean;
   body?: unknown;
   error?: string;
+}
+
+class RelayOpenError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 export class BrowserRelay {
@@ -136,6 +146,7 @@ export class BrowserRelay {
       grant: token,
       identityKey: pemRawKey(identity.publicKeyPem),
       key: null,
+      closed: false,
       sequence: 0,
       ready,
       resolveReady,
@@ -173,6 +184,8 @@ export class BrowserRelay {
     body: unknown,
   ): Promise<unknown> {
     await state.ready;
+    if (state.closed || this.channels.get(state.channelId) !== state)
+      throw new Error("加密通道已断开，正在恢复");
     if (!state.key) throw new Error("通道密钥不可用");
     const requestId = crypto.randomUUID();
     const sequence = state.sequence++;
@@ -218,7 +231,7 @@ export class BrowserRelay {
     if (this.socketReady) return this.socketReady;
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${scheme}//${location.host}/ws/v1/browser?csrf=${encodeURIComponent(csrfToken())}`;
-    this.socketReady = new Promise<void>((resolve, reject) => {
+    const readyPromise = new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(url);
       this.socket = socket;
       let ready = false;
@@ -252,9 +265,14 @@ export class BrowserRelay {
       socket.addEventListener("close", () => {
         clearTimeout(readyTimer);
         if (!ready) reject(new Error("中继已断开"));
+        // A failed socket may finish closing after a retry has already
+        // created its replacement.  Never let the stale close event tear
+        // down the replacement connection or its channels.
+        if (this.socket !== socket) return;
         this.socket = null;
         this.socketReady = null;
         for (const channel of this.channels.values()) {
+          channel.closed = true;
           channel.rejectReady(new Error("中继已断开"));
           channel.onEvent({ type: "channel.disconnected" });
           for (const pending of channel.pending.values())
@@ -264,7 +282,11 @@ export class BrowserRelay {
         this.channels.clear();
       });
     });
-    return this.socketReady;
+    this.socketReady = readyPromise;
+    void readyPromise.catch(() => {
+      if (this.socketReady === readyPromise) this.socketReady = null;
+    });
+    return readyPromise;
   }
 
   private send(payload: unknown): void {
@@ -370,7 +392,8 @@ export class BrowserRelay {
         );
         if (opening) {
           opening.rejectReady(
-            new Error(
+            new RelayOpenError(
+              String(message.code ?? "unknown"),
               message.code === "host_offline"
                 ? "主机已离线"
                 : `代理通道连接失败（${String(message.code ?? "unknown")}）`,
@@ -456,6 +479,7 @@ export class BrowserRelay {
     notifyAgent = false,
   ): void {
     if (!this.channels.delete(state.channelId)) return;
+    state.closed = true;
     state.rejectReady(error);
     for (const pending of state.pending.values()) pending.reject(error);
     state.pending.clear();
@@ -497,10 +521,14 @@ function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 }
 
 function isRetryableOpenError(error: unknown): boolean {
+  if (error instanceof RelayOpenError)
+    return ["host_offline", "host_degraded", "agent_not_ready"].includes(
+      error.code,
+    );
   if (isApiError(error)) {
     return (
       error.status >= 500 ||
-      ["host_offline", "host_degraded", "host_unsupported"].includes(error.code)
+      ["host_offline", "host_degraded"].includes(error.code)
     );
   }
   if (!(error instanceof Error)) return true;

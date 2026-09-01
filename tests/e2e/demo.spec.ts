@@ -115,6 +115,31 @@ test("renders Markdown and collapses completed tool calls", async ({
   await expect(tool.getByText("<system>")).toHaveCount(0);
 });
 
+test("keeps message actions, archive navigation, and details toggle usable", async ({
+  page,
+}, testInfo) => {
+  await expect(
+    page.getByRole("button", { name: "复制内容" }).first(),
+  ).toBeVisible();
+  if (!testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "收起详情面板" }).click();
+    await expect(page.locator("aside.details-panel")).toBeHidden();
+    await page.getByRole("button", { name: "展开详情面板" }).click();
+    await expect(page.locator("aside.details-panel")).toBeVisible();
+  }
+  await openMobileNavigation(page, testInfo.project.name);
+  await page.getByRole("button", { name: "归档", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "归档对话" })).toBeVisible();
+});
+
+test("exposes a stable conversation bottom anchor", async ({ page }) => {
+  await expect(page.locator(".conversation-bottom-anchor")).toHaveCount(1);
+  await expect(page.locator(".conversation-body")).toHaveCSS(
+    "overflow-y",
+    "auto",
+  );
+});
+
 test("groups conversations by project and keeps composer choices stable", async ({
   page,
 }) => {

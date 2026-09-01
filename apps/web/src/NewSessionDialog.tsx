@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { PermissionMode } from "@aialra-kimi/protocol";
 
 export interface NewSessionInput {
@@ -8,23 +8,40 @@ export interface NewSessionInput {
   permissionMode: PermissionMode;
 }
 
+export interface WorkspaceOption {
+  root: string;
+  name: string;
+}
+
 export function NewSessionDialog({
   platform,
   defaultPermissionMode,
+  recentWorkspaces = [],
+  workspaceMissing = false,
+  submitting: externalSubmitting = false,
   onCreate,
+  onEnsureWorkspace,
   onClose,
 }: {
   platform: "windows" | "linux";
   defaultPermissionMode: PermissionMode;
+  recentWorkspaces?: WorkspaceOption[];
+  workspaceMissing?: boolean;
+  submitting?: boolean;
   onCreate(input: NewSessionInput): Promise<void>;
+  onEnsureWorkspace?(): Promise<void>;
   onClose(): void;
 }) {
-  const [workspace, setWorkspace] = useState("");
+  const [workspace, setWorkspace] = useState(recentWorkspaces[0]?.root ?? "");
   const [title, setTitle] = useState("");
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(
     defaultPermissionMode,
   );
-  const [submitting, setSubmitting] = useState(false);
+  const [localSubmitting, setSubmitting] = useState(false);
+  const busy = localSubmitting || externalSubmitting;
+  useEffect(() => {
+    setWorkspace((current) => current || recentWorkspaces[0]?.root || "");
+  }, [recentWorkspaces]);
   return (
     <div
       className="dialog-scrim"
@@ -71,7 +88,15 @@ export function NewSessionDialog({
                 : "/srv/projects/my-project"
             }
             required
+            list="recent-kimi-workspaces"
           />
+          <datalist id="recent-kimi-workspaces">
+            {recentWorkspaces.map((item) => (
+              <option key={item.root} value={item.root}>
+                {item.name}
+              </option>
+            ))}
+          </datalist>
         </label>
         <label>
           标题，可选
@@ -97,15 +122,31 @@ export function NewSessionDialog({
         <p className="dialog-note">
           完整路径只通过浏览器到目标主机的加密通道传输
         </p>
+        {workspaceMissing && (
+          <div className="workspace-missing" role="alert">
+            <strong>工作区不存在</strong>
+            <span>可以在目标主机创建这个目录，然后继续创建会话</span>
+            {onEnsureWorkspace && (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void onEnsureWorkspace()}
+                disabled={busy}
+              >
+                创建工作区并重试
+              </button>
+            )}
+          </div>
+        )}
         <div className="dialog-actions">
           <button type="button" onClick={onClose}>
             取消
           </button>
           <button
             className="primary-button"
-            disabled={submitting || !workspace.trim()}
+            disabled={busy || !workspace.trim()}
           >
-            {submitting ? "正在创建…" : "创建会话"}
+            {busy ? "正在创建…" : "创建会话"}
           </button>
         </div>
       </form>

@@ -33,9 +33,23 @@
         "sessions.list",
         "sessions.create",
         "sessions.archive",
+        "sessions.restore",
         "sessions.fork"
       ],
       "evidence": "The host sidebar and session header expose the supported upstream lifecycle"
+    },
+    {
+      "id": "archive-management",
+      "status": "native",
+      "operations": ["sessions.list", "sessions.archive", "sessions.restore"],
+      "evidence": "The archive view filters archived sessions and verifies restore before returning to the active list"
+    },
+    {
+      "id": "workspace-memory-and-create",
+      "status": "secured",
+      "operations": ["workspaces.list", "workspaces.ensure", "sessions.create"],
+      "evidence": "The new-session dialog remembers host-scoped workspaces and requires explicit confirmation before creating a missing directory",
+      "securityRationale": "Workspace creation is restricted by the agent allowlist and never exposes a general filesystem API"
     },
     {
       "id": "permanent-session-deletion",

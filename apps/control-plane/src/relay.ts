@@ -32,6 +32,13 @@ interface BrowserConnection {
       lastSequence: number;
     }
   >;
+  /**
+   * A failed browser handshake still needs a narrowly scoped online wake-up
+   * so a cold-starting agent can be retried without waiting for the full
+   * backoff interval.  Watches expire and are removed with the browser socket
+   * so they cannot become an unbounded host index.
+   */
+  hostWatches: Map<string, ReturnType<typeof setTimeout>>;
 }
 
 // A 5 MiB attachment expands through JSON base64 and encrypted framing
@@ -41,6 +48,8 @@ const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const MAX_AGENT_CONNECTIONS = 128;
 const MAX_BROWSER_CONNECTIONS = 16;
 const MAX_CHANNELS_PER_BROWSER = 8;
+const MAX_HOST_WATCHES_PER_BROWSER = 32;
+const HOST_WATCH_TTL_MS = 30_000;
 const MAX_HANDSHAKES_PER_MINUTE = 600;
 const MAX_AGENT_MESSAGES_PER_TEN_SECONDS = 3_000;
 const MAX_BROWSER_MESSAGES_PER_TEN_SECONDS = 600;
@@ -373,6 +382,7 @@ export class RelayService {
       socket,
       principal,
       channels: new Map(),
+      hostWatches: new Map(),
     };
     const messageRate: RateWindow = { startedAt: Date.now(), count: 0 };
     this.browsers.add(connection);
@@ -445,6 +455,7 @@ export class RelayService {
             code: "grant_rejected",
           });
         }
+        this.watchHost(connection, envelope.hostId);
         connection.channels.set(envelope.channelId, {
           hostId: envelope.hostId,
           grant: envelope.grant,
@@ -488,6 +499,8 @@ export class RelayService {
     });
     socket.on("close", () => {
       this.browsers.delete(connection);
+      for (const timer of connection.hostWatches.values()) clearTimeout(timer);
+      connection.hostWatches.clear();
       for (const [channelId, channel] of connection.channels) {
         const agent = this.agents.get(channel.hostId);
         if (agent)
@@ -546,6 +559,7 @@ export class RelayService {
     for (const browser of this.browsers) {
       if (
         !hostId ||
+        browser.hostWatches.has(hostId) ||
         [...browser.channels.values()].some(
           (channel) => channel.hostId === hostId,
         )
@@ -553,6 +567,24 @@ export class RelayService {
         send(browser.socket, payload);
       }
     }
+  }
+
+  private watchHost(connection: BrowserConnection, hostId: string): void {
+    const previous = connection.hostWatches.get(hostId);
+    if (previous) clearTimeout(previous);
+    else if (connection.hostWatches.size >= MAX_HOST_WATCHES_PER_BROWSER) {
+      const oldest = connection.hostWatches.keys().next().value;
+      if (typeof oldest === "string") {
+        const timer = connection.hostWatches.get(oldest);
+        if (timer) clearTimeout(timer);
+        connection.hostWatches.delete(oldest);
+      }
+    }
+    const timer = setTimeout(() => {
+      if (connection.hostWatches.get(hostId) === timer)
+        connection.hostWatches.delete(hostId);
+    }, HOST_WATCH_TTL_MS);
+    connection.hostWatches.set(hostId, timer);
   }
 }
 

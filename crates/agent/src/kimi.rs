@@ -1,11 +1,16 @@
-use std::{path::PathBuf, process::Stdio, sync::OnceLock, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{process::Child, time::sleep};
+use tokio::{fs, process::Child, time::sleep};
 use tracing::warn;
 
 use crate::config::AgentConfig;
@@ -187,7 +192,7 @@ impl KimiClient {
     pub async fn operation(&self, host_id: &str, operation: &str, body: Value) -> Result<Value> {
         match operation {
             "meta.read" => self.data(Method::GET, "/api/v1/meta", None).await,
-            "sessions.list" => self.list_sessions(host_id).await,
+            "sessions.list" => self.list_sessions(host_id, Some(&body)).await,
             "sessions.create" => self.create_session(host_id, body).await,
             "sessions.read" => {
                 let id = required_path_segment(&body, "sessionId")?;
@@ -195,6 +200,10 @@ impl KimiClient {
                     .await
             }
             "sessions.archive" => self.session_action(&body, "archive").await,
+            "sessions.restore" => {
+                let data = self.session_action(&body, "restore").await?;
+                Ok(json!({ "session": normalize_session(host_id, &data) }))
+            }
             "sessions.fork" => {
                 let data = self.session_action(&body, "fork").await?;
                 Ok(json!({ "session": normalize_session(host_id, &data) }))
@@ -204,6 +213,10 @@ impl KimiClient {
             "sessions.snapshot" => self.snapshot(body).await,
             "sessions.transcript.read" => self.transcript(body).await,
             "sessions.transcript.resume" => self.transcript_ops(body).await,
+            "sessions.transcript.subscribe" => {
+                required_path_segment(&body, "sessionId")?;
+                Ok(json!({ "subscribed": true }))
+            }
             "sessions.messages.page" => self.transcript(body).await,
             "sessions.prompts.list" => self.prompts(body).await,
             "sessions.prompts.steer" => self.prompt_action(body, "steer").await,
@@ -239,6 +252,8 @@ impl KimiClient {
             "sessions.files.status" => self.file_status(body).await,
             "sessions.permission.read" => self.permission(body).await,
             "sessions.permission.write" => self.set_permission(body).await,
+            "workspaces.list" => self.list_workspaces().await,
+            "workspaces.ensure" => self.ensure_workspace(body).await,
             "oauth.userinfo" => self.data(Method::GET, "/api/v1/oauth/userinfo", None).await,
             "oauth.usage" => self.usage().await,
             "oauth.device.start" => {
@@ -255,7 +270,7 @@ impl KimiClient {
     }
 
     pub async fn session_cache(&self, host_id: &str) -> Result<Vec<Value>> {
-        let list = self.list_sessions(host_id).await?;
+        let list = self.list_sessions(host_id, None).await?;
         Ok(list
             .get("sessions")
             .and_then(Value::as_array)
@@ -272,9 +287,44 @@ impl KimiClient {
             .collect())
     }
 
-    async fn list_sessions(&self, host_id: &str) -> Result<Value> {
+    async fn list_sessions(&self, host_id: &str, body: Option<&Value>) -> Result<Value> {
+        let mut query = vec!["exclude_empty=false".to_owned()];
+        if body
+            .and_then(|value| value.get("includeArchived"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            query.push("include_archive=true".to_owned());
+        }
+        if body
+            .and_then(|value| value.get("archivedOnly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            query.push("archived_only=true".to_owned());
+        }
+        if let Some(page_size) = body
+            .and_then(|value| value.get("pageSize"))
+            .and_then(Value::as_u64)
+        {
+            query.push(format!("page_size={}", page_size.clamp(1, 100)));
+        }
+        for (key, query_key) in [("beforeId", "before_id"), ("afterId", "after_id")] {
+            if let Some(value) = body
+                .and_then(|body| body.get(key))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                validate_path_segment(value, key)?;
+                query.push(format!("{query_key}={value}"));
+            }
+        }
         let data = self
-            .data(Method::GET, "/api/v1/sessions?exclude_empty=false", None)
+            .data(
+                Method::GET,
+                &format!("/api/v1/sessions?{}", query.join("&")),
+                None,
+            )
             .await?;
         let sessions = data
             .get("items")
@@ -289,12 +339,86 @@ impl KimiClient {
         Ok(json!({ "sessions": sessions }))
     }
 
+    async fn list_workspaces(&self) -> Result<Value> {
+        let data = self.data(Method::GET, "/api/v1/workspaces", None).await?;
+        let items = data
+            .get("items")
+            .or_else(|| data.get("workspaces"))
+            .cloned()
+            .or_else(|| data.as_array().map(|_| data.clone()))
+            .unwrap_or_else(|| json!([]));
+        Ok(json!({
+            "items": items
+        }))
+    }
+
+    async fn ensure_workspace(&self, body: Value) -> Result<Value> {
+        if body.get("confirmed").and_then(Value::as_bool) != Some(true) {
+            bail!("workspace creation requires explicit confirmation");
+        }
+        let root = required_string(&body, "root")?;
+        let path = Path::new(root);
+        if !path.is_absolute() || root.len() > 4096 || root.contains('\0') {
+            bail!("workspace root must be an absolute path of at most 4096 bytes");
+        }
+        validate_workspace_root(path)?;
+        if !path.exists() {
+            let existing_ancestor = nearest_existing_ancestor(path)?;
+            let canonical_ancestor = existing_ancestor.canonicalize().with_context(|| {
+                format!(
+                    "workspace parent is unavailable: {}",
+                    existing_ancestor.display()
+                )
+            })?;
+            validate_workspace_root(&canonical_ancestor)?;
+            fs::create_dir_all(path)
+                .await
+                .context("failed to create workspace directory")?;
+        }
+        if !path.is_dir() {
+            bail!("workspace root is not a directory");
+        }
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("workspace root is unavailable: {}", path.display()))?;
+        validate_workspace_root(&canonical)?;
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.chars().count() <= 100)
+            .map(str::to_owned);
+        let payload = match name {
+            Some(name) => json!({ "root": root, "name": name }),
+            None => json!({ "root": root }),
+        };
+        self.data(Method::POST, "/api/v1/workspaces", Some(payload))
+            .await
+    }
+
     async fn create_session(&self, host_id: &str, body: Value) -> Result<Value> {
         let workspace = body
             .pointer("/metadata/cwd")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty() && value.len() <= 4096 && !value.contains('\0'))
             .context("session workspace is required and must be at most 4096 bytes")?;
+        let workspace_path = Path::new(workspace);
+        if !workspace_path.is_absolute() {
+            bail!("session workspace must be an absolute path");
+        }
+        // Session creation must use the same allowlist as explicit workspace
+        // registration.  Existing paths are canonicalized so a symlink cannot
+        // escape the configured roots; missing paths remain lexical so the
+        // upstream 40409 flow can ask the user to confirm creation.
+        validate_workspace_root(workspace_path)?;
+        if workspace_path.exists() {
+            let canonical = workspace_path
+                .canonicalize()
+                .with_context(|| format!("session workspace is unavailable: {workspace}"))?;
+            validate_workspace_root(&canonical)?;
+            if !canonical.is_dir() {
+                bail!("session workspace is not a directory");
+            }
+        }
         let title = body
             .get("title")
             .and_then(Value::as_str)
@@ -484,8 +608,11 @@ impl KimiClient {
 
     async fn prompts(&self, body: Value) -> Result<Value> {
         let id = required_path_segment(&body, "sessionId")?;
-        self.data(Method::GET, &format!("/api/v1/sessions/{id}/prompts"), None)
-            .await
+        let data = self
+            .data(Method::GET, &format!("/api/v1/sessions/{id}/prompts"), None)
+            .await?;
+        let prompts = normalize_prompt_queue(&data);
+        Ok(json!({ "prompts": prompts }))
     }
 
     async fn prompt_action(&self, mut body: Value, action: &str) -> Result<Value> {
@@ -1053,9 +1180,10 @@ fn builtin_commands() -> Value {
 }
 
 fn normalize_session(host_id: &str, value: &Value) -> Value {
+    let pending_interaction = value.get("pending_interaction").and_then(Value::as_str);
     let state = if value.get("busy").and_then(Value::as_bool).unwrap_or(false) {
         "running"
-    } else if value.get("pending_interaction").and_then(Value::as_str) != Some("none") {
+    } else if pending_interaction.is_some_and(|value| value != "none") {
         "waiting"
     } else if value.get("last_turn_reason").and_then(Value::as_str) == Some("failed") {
         "error"
@@ -1183,6 +1311,67 @@ fn workspace_alias(path: &str) -> String {
     }
 }
 
+fn normalize_prompt_queue(data: &Value) -> Value {
+    if let Some(prompts) = data.get("prompts").and_then(Value::as_array) {
+        return Value::Array(prompts.clone());
+    }
+    if let Some(items) = data.get("items").and_then(Value::as_array) {
+        return Value::Array(items.clone());
+    }
+    if data.is_array() {
+        return data.clone();
+    }
+    let mut prompts = Vec::new();
+    if let Some(active) = data.get("active").filter(|value| !value.is_null()) {
+        prompts.push(active.clone());
+    }
+    if let Some(queued) = data.get("queued").and_then(Value::as_array) {
+        prompts.extend(queued.iter().cloned());
+    }
+    Value::Array(prompts)
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return Ok(current.to_path_buf());
+        }
+        current = current
+            .parent()
+            .context("workspace root has no existing ancestor")?;
+    }
+}
+
+fn validate_workspace_root(path: &Path) -> Result<()> {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("workspace root cannot contain parent-directory components");
+    }
+    let custom_roots = std::env::var("AIALRA_KIMI_WORKSPACE_ROOTS").unwrap_or_default();
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    if custom_roots
+        .split(separator)
+        .filter(|root| !root.trim().is_empty())
+        .map(Path::new)
+        .any(|root| path.starts_with(root))
+    {
+        return Ok(());
+    }
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+        && path.starts_with(home)
+    {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if path.starts_with(Path::new("/srv")) || path.starts_with(Path::new("/opt/aialra")) {
+        return Ok(());
+    }
+    bail!("workspace root is outside the configured workspace roots")
+}
+
 fn kimi_token_path() -> Result<PathBuf> {
     if let Some(home) = KIMI_HOME_OVERRIDE.get() {
         return Ok(home.join("server.token"));
@@ -1245,6 +1434,27 @@ mod tests {
             path.components()
                 .any(|part| part == std::path::Component::ParentDir)
         );
+    }
+
+    #[test]
+    fn rejects_workspace_roots_outside_safe_locations() {
+        #[cfg(unix)]
+        assert!(
+            validate_workspace_root(Path::new("/etc/aialra"))
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
+    }
+
+    #[test]
+    fn normalizes_prompt_queue_snapshot() {
+        let prompts = normalize_prompt_queue(&json!({
+            "active": { "prompt_id": "running", "status": "running" },
+            "queued": [{ "prompt_id": "queued", "status": "queued" }]
+        }));
+        assert_eq!(prompts[0]["prompt_id"], "running");
+        assert_eq!(prompts[1]["prompt_id"], "queued");
     }
 
     #[test]
