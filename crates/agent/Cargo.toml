@@ -32,7 +32,7 @@ sha2 = "0.10.9"
 subtle = "2.6.1"
 time = { version = "0.3.44", features = ["formatting"] }
 tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-tungstenite = { version = "0.27.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 url = { version = "2.5.7", features = ["serde"] }
