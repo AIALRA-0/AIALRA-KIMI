@@ -94,6 +94,9 @@ export async function createApp(config: AppConfig): Promise<AppServices> {
   });
 
   const db = new ControlPlaneDatabase(config.databasePath, config.databaseKey);
+  // A persisted online flag is only a last observation.  Every process start
+  // must require a fresh agent heartbeat before exposing a host as online.
+  db.markAllHostsOffline();
   const auth = new AuthService(config);
   const signer = new GrantSigner(config.grantSigningPrivateKey);
   const relay = new RelayService(config, db, auth, signer, upstreamLock);

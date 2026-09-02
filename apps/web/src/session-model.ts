@@ -161,6 +161,14 @@ export interface UiSessionSnapshot {
   status: UiSessionStatus;
 }
 
+/**
+ * Session identifiers are only unique within a Kimi host. Keep browser
+ * state scoped to both values so delayed responses cannot cross hosts.
+ */
+export function hostSessionKey(hostId: string, sessionId: string): string {
+  return JSON.stringify([hostId, sessionId]);
+}
+
 export interface KimiEventEnvelope {
   type: string;
   sessionId: string | null;

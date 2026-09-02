@@ -34,7 +34,7 @@ use crate::{
 };
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_RELAY_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_RELAY_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ACTIVE_CHANNELS: usize = 16;
 const MAX_RELAY_SILENCE: Duration = Duration::from_secs(45);
 
@@ -291,6 +291,7 @@ async fn run_connection(
                                         "type": "agent.error",
                                         "requestId": value.get("requestId"),
                                         "hostId": config.host_id,
+                                        "channelId": channel_id,
                                         "code": "channel_limit_reached",
                                         "message": "encrypted channel limit was reached"
                                     })).await?;
@@ -313,6 +314,7 @@ async fn run_connection(
                                         "type": "agent.error",
                                         "requestId": value.get("requestId"),
                                         "hostId": config.host_id,
+                                        "channelId": channel_id,
                                         "code": "channel_rejected",
                                         "message": "encrypted channel setup was rejected"
                                     })).await?;
@@ -369,6 +371,7 @@ async fn run_connection(
                                             "type": "agent.error",
                                             "requestId": Value::Null,
                                             "hostId": config.host_id,
+                                            "channelId": frame_channel_id(&value),
                                             "code": "channel_frame_rejected",
                                             "message": "encrypted channel frame was rejected"
                                         })).await?;
@@ -393,19 +396,39 @@ async fn run_connection(
             }
             output = terminal_rx.recv() => {
                 if let Some(output) = output {
-                    let channel_id = terminals.lock().await.route_output(&output);
+                    let (channel_id, exited) = {
+                        let mut terminals = terminals.lock().await;
+                        let channel_id = terminals.route_output(&output);
+                        if output.exited {
+                            terminals.finish(&output.terminal_id);
+                        }
+                        (channel_id, output.exited)
+                    };
                     if let Some(channel_id) = channel_id {
-                        let frame = channels
-                            .lock()
-                            .await
-                            .get_mut(&channel_id)
-                            .map(|channel| channel.encrypt(&json!({ "event": {
-                                "type": "terminal.output",
-                                "terminalId": output.terminal_id,
-                                "data": output.data
-                            }})))
-                            .transpose()?;
-                        if let Some(frame) = frame {
+                        let frames = {
+                            let mut channels = channels.lock().await;
+                            let Some(channel) = channels.get_mut(&channel_id) else {
+                                continue;
+                            };
+                            let mut frames = Vec::with_capacity(2);
+                            if !output.data.is_empty() {
+                                frames.push(channel.encrypt(&json!({ "event": {
+                                    "type": "terminal.output",
+                                    "terminalId": output.terminal_id,
+                                    "data": output.data
+                                }}))?);
+                            }
+                            if exited {
+                                frames.push(channel.encrypt(&json!({ "event": {
+                                    "type": "terminal.exit",
+                                    "terminalId": output.terminal_id,
+                                    "reason": output.exit_reason.unwrap_or_else(|| "process_exited".to_owned()),
+                                    "exitCode": output.exit_code
+                                }}))?);
+                            }
+                            frames
+                        };
+                        for frame in frames {
                             outgoing_tx.send(json!({ "type": "agent.frame", "hostId": config.host_id, "frame": frame })).await?;
                         }
                     }
@@ -507,6 +530,15 @@ async fn prepare_browser_frame(
     })
 }
 
+fn frame_channel_id(value: &Value) -> Value {
+    value
+        .pointer("/frame/channelId")
+        .and_then(Value::as_str)
+        .filter(|channel_id| Uuid::parse_str(channel_id).is_ok())
+        .map(|channel_id| Value::String(channel_id.to_owned()))
+        .unwrap_or(Value::Null)
+}
+
 async fn handle_browser_request(
     prepared: PreparedBrowserRequest,
     config: &AgentConfig,
@@ -537,6 +569,7 @@ async fn handle_browser_request(
                 "type": "agent.error",
                 "requestId": Value::Null,
                 "hostId": config.host_id,
+                "channelId": channel_id,
                 "code": "channel_frame_rejected",
                 "message": "encrypted channel frame was rejected"
             }))

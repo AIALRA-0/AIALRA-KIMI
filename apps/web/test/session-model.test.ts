@@ -5,12 +5,22 @@ import {
   coalesceToolMessages,
   decodeKimiEvent,
   finishAssistantTurn,
+  hostSessionKey,
   shouldApplySequence,
   turnFailureMessage,
   withInFlightMessage,
 } from "../src/session-model.js";
 
 describe("Kimi session event model", () => {
+  it("scopes per-session state by host and session", () => {
+    expect(hostSessionKey("host-a", "session-1")).toBe(
+      '["host-a","session-1"]',
+    );
+    expect(hostSessionKey("host-a", "session-1")).not.toBe(
+      hostSessionKey("host-b", "session-1"),
+    );
+  });
+
   it("decodes the official session event envelope", () => {
     expect(
       decodeKimiEvent({

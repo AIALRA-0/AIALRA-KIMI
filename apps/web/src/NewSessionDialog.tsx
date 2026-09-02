@@ -1,6 +1,7 @@
 import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { PermissionMode } from "@aialra-kimi/protocol";
+import { DialogShell } from "./DialogShell.js";
 
 export interface NewSessionInput {
   workspace: string;
@@ -43,17 +44,12 @@ export function NewSessionDialog({
     setWorkspace((current) => current || recentWorkspaces[0]?.root || "");
   }, [recentWorkspaces]);
   return (
-    <div
-      className="dialog-scrim"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
+    <DialogShell labelledBy="new-session-title" busy={busy} onClose={onClose}>
       <form
         className="dialog-card"
         onSubmit={(event) => {
           event.preventDefault();
+          if (busy) return;
           setSubmitting(true);
           void onCreate({
             workspace: workspace.trim(),
@@ -65,12 +61,13 @@ export function NewSessionDialog({
         <div className="dialog-head">
           <div>
             <p className="eyebrow">新建 KIMI 会话</p>
-            <h2>选择执行工作区</h2>
+            <h2 id="new-session-title">选择执行工作区</h2>
           </div>
           <button
             type="button"
             className="icon-button"
             onClick={onClose}
+            disabled={busy}
             aria-label="关闭新建会话窗口"
           >
             <X size={17} />
@@ -79,7 +76,7 @@ export function NewSessionDialog({
         <label>
           此主机上的工作区
           <input
-            autoFocus
+            data-dialog-initial-focus="true"
             value={workspace}
             onChange={(event) => setWorkspace(event.target.value)}
             placeholder={
@@ -139,7 +136,7 @@ export function NewSessionDialog({
           </div>
         )}
         <div className="dialog-actions">
-          <button type="button" onClick={onClose}>
+          <button type="button" onClick={onClose} disabled={busy}>
             取消
           </button>
           <button
@@ -150,6 +147,6 @@ export function NewSessionDialog({
           </button>
         </div>
       </form>
-    </div>
+    </DialogShell>
   );
 }

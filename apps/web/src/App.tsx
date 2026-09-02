@@ -32,14 +32,13 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type {
   HostDescriptor,
   PermissionMode,
   UsageSnapshot,
 } from "@aialra-kimi/protocol";
 import { ActivityPanel } from "./ActivityPanel.js";
-import { ArchiveManager } from "./ArchiveManager.js";
 import { ApiError, api } from "./api.js";
 import {
   BUILTIN_COMMANDS,
@@ -69,6 +68,7 @@ import {
   type OAuthFlow,
 } from "./KimiOAuthPanel.js";
 import { CopyButton, MarkdownMessage, ToolMessage } from "./MessageBody.js";
+import { DialogShell } from "./DialogShell.js";
 import { supportedEfforts } from "./model-options.js";
 import {
   NewSessionDialog,
@@ -78,7 +78,6 @@ import {
 import { PairingDialog } from "./PairingDialog.js";
 import { relayRetryDelay, transcriptRetryDelay } from "./recovery-policy.js";
 import { BrowserRelay, type RelayChannel } from "./relay.js";
-import { TerminalPanel } from "./TerminalPanel.js";
 import { TranscriptTimeline } from "./TranscriptTimeline.js";
 import {
   applyTranscriptReset,
@@ -97,6 +96,7 @@ import {
   coalesceToolMessages,
   decodeKimiEvent,
   finishAssistantTurn,
+  hostSessionKey,
   turnFailureMessage,
   shouldApplySequence,
   withInFlightMessage,
@@ -145,7 +145,29 @@ interface ModelDescriptor {
   default_effort?: string;
 }
 
+interface QueuedTranscriptEvent {
+  hostId: string;
+  generation: number;
+  sessionId: string;
+  event: KimiEventEnvelope;
+}
+
+interface SessionCursor {
+  sequence: number;
+  epoch: string | null;
+}
+
 const relay = new BrowserRelay();
+const LazyArchiveManager = lazy(() =>
+  import("./ArchiveManager.js").then(({ ArchiveManager }) => ({
+    default: ArchiveManager,
+  })),
+);
+const LazyTerminalPanel = lazy(() =>
+  import("./TerminalPanel.js").then(({ TerminalPanel }) => ({
+    default: TerminalPanel,
+  })),
+);
 const kimiScopes = [
   "sessions.list",
   "sessions.create",
@@ -367,6 +389,10 @@ export default function App() {
     id: number;
     data: string;
   } | null>(null);
+  const [terminalExit, setTerminalExit] = useState<{
+    reason: string;
+    exitCode: number | null;
+  } | null>(null);
   const [status, setStatus] = useState(demo ? "合成预览" : "正在连接");
   const [query, setQuery] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -423,16 +449,18 @@ export default function App() {
   const messagesRef = useRef(messages);
   const transcriptRef = useRef<TranscriptState | null>(transcript);
   const transcriptSessionIdRef = useRef(transcriptSessionId);
-  const transcriptEventQueueRef = useRef<KimiEventEnvelope[]>([]);
+  const transcriptEventQueueRef = useRef<QueuedTranscriptEvent[]>([]);
   const transcriptFlushFrameRef = useRef<number | null>(null);
-  const cursorRef = useRef(new Map<string, number>());
+  const cursorRef = useRef(new Map<string, SessionCursor>());
   const refreshTimer = useRef<number | null>(null);
   const refreshGenerationRef = useRef(0);
   const oauthTimer = useRef<number | null>(null);
   const oauthHostRef = useRef<string | null>(null);
+  const oauthFlowRef = useRef<OAuthFlow | null>(oauthFlow);
   const connectedHostRef = useRef<string | null>(null);
   const reconnectAttemptRef = useRef(0);
   const browserReconnectTimer = useRef<number | null>(null);
+  const terminalReconnectTimer = useRef<number | null>(null);
   const transcriptRetryAttemptRef = useRef(0);
   const transcriptRetryTimer = useRef<number | null>(null);
   const sendRequestRef = useRef(0);
@@ -448,6 +476,7 @@ export default function App() {
   >({});
   const promptActionLocksRef = useRef(new Set<string>());
   const retryPromptRef = useRef<{
+    hostId: string;
     sessionId: string;
     promptId: string;
     text: string;
@@ -551,6 +580,10 @@ export default function App() {
   useEffect(() => {
     transcriptSessionIdRef.current = transcriptSessionId;
   }, [transcriptSessionId]);
+
+  useEffect(() => {
+    oauthFlowRef.current = oauthFlow;
+  }, [oauthFlow]);
 
   useEffect(() => {
     if (demo || !channel || !host || !newSessionOpen) return;
@@ -861,6 +894,9 @@ export default function App() {
     const abortController = new AbortController();
     const changingHost = connectedHostRef.current !== host.hostId;
     connectedHostRef.current = host.hostId;
+    clearRefreshTimer();
+    clearTranscriptRetry();
+    if (changingHost) clearBrowserReconnectTimer();
     channelRef.current?.close();
     channelRef.current = null;
     setChannel(null);
@@ -897,10 +933,11 @@ export default function App() {
       setPrompt("");
       setAttachments([]);
       reconnectAttemptRef.current = 0;
+      oauthHostRef.current = null;
+      clearOAuthTimer();
+      oauthFlowRef.current = null;
     }
     setSessionsPhase(changingHost ? "loading" : "reconnecting");
-    oauthHostRef.current = null;
-    if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
     setStatus("等待代理启动");
     void (async () => {
       try {
@@ -947,7 +984,7 @@ export default function App() {
           host.hostId,
           "kimi",
           [...kimiScopes],
-          handleAgentEvent,
+          (raw) => handleAgentEvent(raw, host.hostId, generation),
           abortController.signal,
         );
         if (
@@ -966,6 +1003,15 @@ export default function App() {
         setError(null);
         setStatus("在线 · 端到端加密");
         reconnectAttemptRef.current = 0;
+        const pendingOAuth = oauthFlowRef.current;
+        if (
+          !changingHost &&
+          oauthHostRef.current === host.hostId &&
+          pendingOAuth?.status === "pending"
+        ) {
+          clearOAuthTimer();
+          scheduleOAuthPoll(pendingOAuth, opened, host.hostId, generation);
+        }
         const sessionResult = await opened.rpc<{ sessions: UiSession[] }>(
           "sessions.list",
         );
@@ -988,7 +1034,12 @@ export default function App() {
         void opened
           .rpc<UsageSnapshot>("oauth.usage")
           .then((snapshot) => {
-            if (!disposed && !abortController.signal.aborted)
+            if (
+              !disposed &&
+              !abortController.signal.aborted &&
+              channelRef.current === opened &&
+              hostGenerationRef.current === generation
+            )
               setUsage(snapshot);
           })
           .catch(() => undefined);
@@ -1049,7 +1100,8 @@ export default function App() {
 
   useEffect(() => {
     if (!modelOptions.length || !sessionId) return;
-    const draft = composerDraftRef.current.get(sessionId);
+    const scopedSessionKey = hostSessionKey(hostId, sessionId);
+    const draft = composerDraftRef.current.get(scopedSessionKey);
     const currentModel = draft?.model || selectedModel;
     const validModel = modelOptions.some((item) => item.model === currentModel)
       ? currentModel
@@ -1060,12 +1112,12 @@ export default function App() {
     const efforts = supportedEfforts(descriptor?.support_efforts);
     if (thinkingLevel && !efforts.includes(thinkingLevel)) {
       setThinkingLevel("");
-      composerDraftRef.current.set(sessionId, {
+      composerDraftRef.current.set(scopedSessionKey, {
         model: validModel,
         thinkingLevel: "",
       });
     }
-  }, [modelOptions, selectedModel, sessionId, thinkingLevel]);
+  }, [hostId, modelOptions, selectedModel, sessionId, thinkingLevel]);
 
   useEffect(() => {
     if (demo || !channel || !host || view !== "archive") return;
@@ -1156,23 +1208,47 @@ export default function App() {
 
   useEffect(() => {
     if (demo) {
+      clearTerminalReconnectTimer();
+      setTerminalExit(null);
       setTerminalPhase(view === "terminal" ? "ready" : "offline");
       return;
     }
     if (view !== "terminal" || !host) {
+      clearTerminalReconnectTimer();
       setTerminalPhase("offline");
       return;
     }
     if (host.state !== "online") {
+      clearTerminalReconnectTimer();
       terminalChannel?.close();
       setTerminalChannel(null);
       setTerminalOutput(null);
+      setTerminalExit(null);
       setTerminalPhase("offline");
       return;
     }
     let disposed = false;
     let opened: RelayChannel | null = null;
     const abortController = new AbortController();
+    const targetHostId = host.hostId;
+    const targetHostGeneration = hostGenerationRef.current;
+    const targetTerminalGeneration = terminalGeneration;
+    const scheduleTerminalReconnect = () => {
+      if (terminalReconnectTimer.current !== null) return;
+      terminalReconnectTimer.current = window.setTimeout(() => {
+        terminalReconnectTimer.current = null;
+        if (
+          !disposed &&
+          view === "terminal" &&
+          host?.hostId === targetHostId &&
+          hostGenerationRef.current === targetHostGeneration &&
+          terminalGeneration === targetTerminalGeneration
+        )
+          setTerminalGeneration((generation) => generation + 1);
+      }, 1_500);
+    };
+    clearTerminalReconnectTimer();
+    setTerminalExit(null);
     setTerminalPhase(terminalChannel ? "reconnecting" : "loading");
     terminalChannel?.close();
     void relay
@@ -1196,7 +1272,12 @@ export default function App() {
         (event) => {
           const value =
             event && typeof event === "object"
-              ? (event as { type?: string; data?: unknown })
+              ? (event as {
+                  type?: string;
+                  data?: unknown;
+                  reason?: unknown;
+                  exitCode?: unknown;
+                })
               : null;
           if (
             value?.type === "terminal.output" &&
@@ -1206,40 +1287,52 @@ export default function App() {
               id: (current?.id ?? 0) + 1,
               data: value.data as string,
             }));
+          } else if (value?.type === "terminal.exit" && !disposed) {
+            setTerminalExit({
+              reason:
+                typeof value.reason === "string" ? value.reason : "exited",
+              exitCode:
+                typeof value.exitCode === "number" ? value.exitCode : null,
+            });
+            setTerminalPhase("ready");
           } else if (value?.type === "channel.disconnected" && !disposed) {
             setTerminalPhase("reconnecting");
-            window.setTimeout(
-              () => setTerminalGeneration((generation) => generation + 1),
-              1_500,
-            );
+            scheduleTerminalReconnect();
           }
         },
         abortController.signal,
       )
       .then((nextChannel) => {
         opened = nextChannel;
-        if (disposed) nextChannel.close();
+        if (
+          disposed ||
+          hostGenerationRef.current !== targetHostGeneration ||
+          host?.hostId !== targetHostId
+        )
+          nextChannel.close();
         else {
           setTerminalChannel(nextChannel);
           setTerminalPhase("ready");
         }
       })
       .catch((nextError: unknown) => {
-        if (!disposed) {
+        if (
+          !disposed &&
+          hostGenerationRef.current === targetHostGeneration &&
+          host?.hostId === targetHostId
+        ) {
           setTerminalPhase("error");
           setError(
             nextError instanceof Error ? nextError.message : "终端连接失败",
           );
-          window.setTimeout(
-            () => setTerminalGeneration((generation) => generation + 1),
-            1_500,
-          );
+          scheduleTerminalReconnect();
         }
       });
     return () => {
       disposed = true;
       abortController.abort();
       opened?.close();
+      clearTerminalReconnectTimer();
       setTerminalChannel(null);
       if (view === "terminal") setTerminalPhase("reconnecting");
     };
@@ -1249,13 +1342,11 @@ export default function App() {
 
   useEffect(
     () => () => {
-      if (refreshTimer.current !== null)
-        window.clearTimeout(refreshTimer.current);
-      if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
-      if (browserReconnectTimer.current !== null)
-        window.clearTimeout(browserReconnectTimer.current);
-      if (transcriptRetryTimer.current !== null)
-        window.clearTimeout(transcriptRetryTimer.current);
+      clearRefreshTimer();
+      clearOAuthTimer();
+      clearBrowserReconnectTimer();
+      clearTerminalReconnectTimer();
+      clearTranscriptRetry();
       if (transcriptFlushFrameRef.current !== null) {
         if (typeof window.cancelAnimationFrame === "function")
           window.cancelAnimationFrame(transcriptFlushFrameRef.current);
@@ -1267,9 +1358,19 @@ export default function App() {
     [],
   );
 
-  function handleAgentEvent(raw: unknown) {
+  function handleAgentEvent(
+    raw: unknown,
+    eventHostId = connectedHostRef.current ?? hostId,
+    eventGeneration = hostGenerationRef.current,
+  ) {
     const event = decodeKimiEvent(raw);
     if (!event) return;
+    if (
+      !eventHostId ||
+      eventHostId !== connectedHostRef.current ||
+      eventGeneration !== hostGenerationRef.current
+    )
+      return;
     if (event.type === "channel.disconnected") {
       channelRef.current = null;
       setChannel(null);
@@ -1279,11 +1380,11 @@ export default function App() {
     }
     const selected = activeSessionRef.current;
     if (event.type === "transcript.reset") {
-      queueTranscriptEvent(event);
+      queueTranscriptEvent(event, eventHostId, eventGeneration);
       return;
     }
     if (event.type === "transcript.ops") {
-      queueTranscriptEvent(event);
+      queueTranscriptEvent(event, eventHostId, eventGeneration);
       return;
     }
     if (event.type === "resync_required") {
@@ -1302,10 +1403,15 @@ export default function App() {
         scheduleSessionListRefresh();
       return;
     }
-    const cursor = cursorRef.current.get(selected) ?? 0;
+    const cursorKey = hostSessionKey(eventHostId, selected);
+    const cursor = cursorRef.current.get(cursorKey)?.sequence ?? 0;
     if (!shouldApplySequence(cursor, event.sequence)) return;
     if (event.sequence !== null) {
-      cursorRef.current.set(selected, event.sequence);
+      const currentCursor = cursorRef.current.get(cursorKey);
+      cursorRef.current.set(cursorKey, {
+        sequence: event.sequence,
+        epoch: currentCursor?.epoch ?? null,
+      });
       setLastSequence(event.sequence);
     }
     const turnId =
@@ -1454,9 +1560,23 @@ export default function App() {
       scheduleRefresh();
   }
 
-  function queueTranscriptEvent(event: KimiEventEnvelope) {
-    if (event.sessionId !== activeSessionRef.current) return;
-    transcriptEventQueueRef.current.push(event);
+  function queueTranscriptEvent(
+    event: KimiEventEnvelope,
+    eventHostId = connectedHostRef.current ?? hostId,
+    eventGeneration = hostGenerationRef.current,
+  ) {
+    if (
+      !eventHostId ||
+      event.sessionId !== activeSessionRef.current ||
+      eventGeneration !== hostGenerationRef.current
+    )
+      return;
+    transcriptEventQueueRef.current.push({
+      hostId: eventHostId,
+      generation: eventGeneration,
+      sessionId: activeSessionRef.current,
+      event,
+    });
     if (transcriptFlushFrameRef.current !== null) return;
     const flush = () => {
       transcriptFlushFrameRef.current = null;
@@ -1473,6 +1593,8 @@ export default function App() {
 
   function flushTranscriptEvents() {
     const selected = activeSessionRef.current;
+    const selectedHostId = connectedHostRef.current ?? hostId;
+    const selectedGeneration = hostGenerationRef.current;
     const events = transcriptEventQueueRef.current.splice(0);
     if (events.length === 0) return;
     let next =
@@ -1482,16 +1604,22 @@ export default function App() {
     let nextSessionId = transcriptSessionIdRef.current;
     let needsReconcile = false;
     for (const event of events) {
-      if (event.sessionId !== selected) continue;
-      if (event.type === "transcript.reset") {
-        const snapshot = event.payload.snapshot as
+      if (
+        event.hostId !== selectedHostId ||
+        event.generation !== selectedGeneration ||
+        event.sessionId !== selected
+      )
+        continue;
+      const value = event.event;
+      if (value.type === "transcript.reset") {
+        const snapshot = value.payload.snapshot as
           | Record<string, unknown>
           | undefined;
         if (!snapshot) continue;
         const page: TranscriptPage = {
-          agent_id: String(event.payload.agent_id ?? "main"),
+          agent_id: String(value.payload.agent_id ?? "main"),
           items: (snapshot.items as TranscriptPage["items"]) ?? [],
-          has_more: Boolean(event.payload.has_more_older),
+          has_more: Boolean(value.payload.has_more_older),
           tasks: (snapshot.tasks as TranscriptPage["tasks"]) ?? [],
           interactions: (snapshot.interactions as unknown[]) ?? [],
           attachments:
@@ -1501,21 +1629,21 @@ export default function App() {
           meta: (snapshot.meta as Record<string, unknown>) ?? {},
           agents: [],
           pending_interactions: [],
-          ...(typeof event.payload.seq === "number"
-            ? { seq: event.payload.seq }
+          ...(typeof value.payload.seq === "number"
+            ? { seq: value.payload.seq }
             : {}),
         };
         next = applyTranscriptReset(next, page);
         nextSessionId = selected;
         continue;
       }
-      const operations = Array.isArray(event.payload.ops)
-        ? (event.payload.ops as TranscriptOperation[])
+      const operations = Array.isArray(value.payload.ops)
+        ? (value.payload.ops as TranscriptOperation[])
         : [];
       const sequence =
-        typeof event.payload.seq === "number" ? event.payload.seq : undefined;
+        typeof value.payload.seq === "number" ? value.payload.seq : undefined;
       const base =
-        next ?? emptyTranscript(String(event.payload.agent_id ?? "main"));
+        next ?? emptyTranscript(String(value.payload.agent_id ?? "main"));
       const result = applyTranscriptOps(base, operations, sequence);
       next = result.state;
       nextSessionId = selected;
@@ -1528,37 +1656,93 @@ export default function App() {
       setTranscriptSessionId(selected);
     }
     if (needsReconcile)
-      window.setTimeout(() => void reconcileTranscript(selected), 0);
+      window.setTimeout(() => {
+        if (
+          connectedHostRef.current === selectedHostId &&
+          hostGenerationRef.current === selectedGeneration &&
+          activeSessionRef.current === selected
+        )
+          void reconcileTranscript(
+            selected,
+            selectedHostId,
+            selectedGeneration,
+          );
+      }, 0);
+  }
+
+  function clearRefreshTimer() {
+    if (refreshTimer.current !== null)
+      window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = null;
+  }
+
+  function clearOAuthTimer() {
+    if (oauthTimer.current !== null) window.clearTimeout(oauthTimer.current);
+    oauthTimer.current = null;
+  }
+
+  function clearBrowserReconnectTimer() {
+    if (browserReconnectTimer.current !== null)
+      window.clearTimeout(browserReconnectTimer.current);
+    browserReconnectTimer.current = null;
+  }
+
+  function clearTerminalReconnectTimer() {
+    if (terminalReconnectTimer.current !== null)
+      window.clearTimeout(terminalReconnectTimer.current);
+    terminalReconnectTimer.current = null;
   }
 
   function scheduleRefresh() {
-    if (refreshTimer.current !== null)
-      window.clearTimeout(refreshTimer.current);
-    refreshTimer.current = window.setTimeout(
-      () => void refreshSession(activeSessionRef.current),
-      180,
-    );
+    clearRefreshTimer();
+    const targetHostId = connectedHostRef.current ?? hostId;
+    const targetGeneration = hostGenerationRef.current;
+    const targetSessionId = activeSessionRef.current;
+    const activeChannel = channelRef.current;
+    if (!targetHostId || !targetSessionId || !activeChannel) return;
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null;
+      if (
+        connectedHostRef.current === targetHostId &&
+        hostGenerationRef.current === targetGeneration &&
+        activeSessionRef.current === targetSessionId &&
+        channelRef.current === activeChannel
+      )
+        void refreshSession(targetSessionId, activeChannel);
+    }, 180);
   }
 
   function scheduleBrowserReconnect() {
     if (browserReconnectTimer.current !== null) return;
+    const targetHostId = connectedHostRef.current ?? hostId;
+    const targetGeneration = hostGenerationRef.current;
+    if (!targetHostId) return;
     reconnectAttemptRef.current += 1;
     const delay = relayRetryDelay(reconnectAttemptRef.current - 1);
     browserReconnectTimer.current = window.setTimeout(() => {
       browserReconnectTimer.current = null;
-      setReconnectGeneration((value) => value + 1);
+      if (
+        connectedHostRef.current === targetHostId &&
+        hostGenerationRef.current === targetGeneration
+      )
+        setReconnectGeneration((value) => value + 1);
     }, delay);
   }
 
   function scheduleSessionListRefresh() {
     const activeChannel = channelRef.current;
+    const targetHostId = connectedHostRef.current ?? hostId;
     if (!activeChannel) return;
     void activeChannel
       .rpc<{ sessions: UiSession[] }>("sessions.list")
       .then((result) => {
-        if (channelRef.current !== activeChannel) return;
-        if (hostId)
-          sessionsByHostRef.current.set(hostId, result.sessions ?? []);
+        if (
+          channelRef.current !== activeChannel ||
+          connectedHostRef.current !== targetHostId
+        )
+          return;
+        if (targetHostId)
+          sessionsByHostRef.current.set(targetHostId, result.sessions ?? []);
         setSessions(result.sessions ?? []);
         setSessionsPhase(result.sessions?.length ? "ready" : "empty");
       })
@@ -1570,11 +1754,16 @@ export default function App() {
     activeChannel = channelRef.current,
   ) {
     if (!activeChannel || !targetSessionId) return;
+    const targetHostId = connectedHostRef.current ?? hostId;
+    const targetHostGeneration = hostGenerationRef.current;
+    const cursorKey = hostSessionKey(targetHostId, targetSessionId);
     const refreshId = ++refreshGenerationRef.current;
     const isCurrent = () =>
       activeSessionRef.current === targetSessionId &&
       refreshGenerationRef.current === refreshId &&
-      channelRef.current === activeChannel;
+      channelRef.current === activeChannel &&
+      connectedHostRef.current === targetHostId &&
+      hostGenerationRef.current === targetHostGeneration;
     try {
       const [snapshot, transcriptResult] = await Promise.all([
         activeChannel.rpc<UiSessionSnapshot>("sessions.snapshot", {
@@ -1589,8 +1778,22 @@ export default function App() {
           .catch(() => null),
       ]);
       if (!isCurrent()) return;
-      cursorRef.current.set(targetSessionId, snapshot.asOfSeq);
-      setLastSequence(snapshot.asOfSeq);
+      const currentCursor = cursorRef.current.get(cursorKey);
+      const snapshotEpoch =
+        typeof snapshot.epoch === "string" ? snapshot.epoch : null;
+      const epochChanged = Boolean(
+        currentCursor?.epoch &&
+          snapshotEpoch &&
+          currentCursor.epoch !== snapshotEpoch,
+      );
+      const nextSequence = epochChanged
+        ? snapshot.asOfSeq
+        : Math.max(currentCursor?.sequence ?? 0, snapshot.asOfSeq);
+      cursorRef.current.set(cursorKey, {
+        sequence: nextSequence,
+        epoch: snapshotEpoch ?? currentCursor?.epoch ?? null,
+      });
+      setLastSequence(nextSequence);
       const snapshotMessages = withInFlightMessage(
         snapshot.messages,
         snapshot.inFlightTurn,
@@ -1618,7 +1821,7 @@ export default function App() {
       setQuestions(snapshot.pendingQuestions ?? []);
       setTasks(snapshot.tasks ?? []);
       setSessionStatus(snapshot.status);
-      const composerDraft = composerDraftRef.current.get(targetSessionId);
+      const composerDraft = composerDraftRef.current.get(cursorKey);
       setSelectedModel(composerDraft?.model ?? snapshot.status.model ?? "");
       setThinkingLevel(
         composerDraft?.thinkingLevel ?? snapshot.status.thinkingLevel ?? "",
@@ -1665,14 +1868,18 @@ export default function App() {
     }
   }
 
-  async function reconcileTranscript(targetSessionId: string) {
+  async function reconcileTranscript(
+    targetSessionId: string,
+    expectedHostId = connectedHostRef.current ?? hostId,
+    expectedGeneration = hostGenerationRef.current,
+  ) {
     const activeChannel = channelRef.current;
     if (!activeChannel || !targetSessionId) return;
-    const generation = hostGenerationRef.current;
     const isCurrent = () =>
       channelRef.current === activeChannel &&
       activeSessionRef.current === targetSessionId &&
-      hostGenerationRef.current === generation;
+      connectedHostRef.current === expectedHostId &&
+      hostGenerationRef.current === expectedGeneration;
     const current =
       transcriptSessionIdRef.current === targetSessionId
         ? transcriptRef.current
@@ -1761,11 +1968,25 @@ export default function App() {
       activeSessionRef.current !== targetSessionId
     )
       return;
+    const targetHostId = connectedHostRef.current ?? hostId;
+    const targetGeneration = hostGenerationRef.current;
+    const activeChannel = channelRef.current;
+    if (!targetHostId || !activeChannel) return;
     const delay = transcriptRetryDelay(transcriptRetryAttemptRef.current);
     transcriptRetryAttemptRef.current += 1;
     transcriptRetryTimer.current = window.setTimeout(() => {
       transcriptRetryTimer.current = null;
-      void reconcileTranscript(targetSessionId);
+      if (
+        connectedHostRef.current === targetHostId &&
+        hostGenerationRef.current === targetGeneration &&
+        activeSessionRef.current === targetSessionId &&
+        channelRef.current === activeChannel
+      )
+        void reconcileTranscript(
+          targetSessionId,
+          targetHostId,
+          targetGeneration,
+        );
     }, delay);
   }
 
@@ -1900,6 +2121,7 @@ export default function App() {
     const retry = retryPromptRef.current;
     const promptId =
       retry &&
+      retry.hostId === (connectedHostRef.current ?? hostId) &&
       retry.sessionId === session.upstreamSessionId &&
       retry.text === text &&
       retry.attachmentIds.length === pendingAttachmentIds.length &&
@@ -2002,6 +2224,7 @@ export default function App() {
         })),
       );
       retryPromptRef.current = {
+        hostId: connectedHostRef.current ?? hostId,
         sessionId: targetSessionId,
         promptId: message.id,
         text,
@@ -2363,29 +2586,30 @@ export default function App() {
     pendingWorkspaceSessionRef.current = input;
     setWorkspaceMissing(false);
     try {
-      const result = await activeChannel.rpc<{ session: UiSession }>(
-        "sessions.create",
-        {
-          ...(input.title ? { title: input.title } : {}),
-          metadata: { cwd: input.workspace },
-        },
-      );
-      if (!isCurrent()) return;
-      await activeChannel.rpc("sessions.permission.write", {
-        sessionId: result.session.upstreamSessionId,
-        permissionMode: input.permissionMode,
+      const result = await activeChannel.rpc<{
+        session: UiSession;
+        initializationErrorCode?: string | null;
+      }>("sessions.create", {
+        ...(input.title ? { title: input.title } : {}),
+        metadata: { cwd: input.workspace },
       });
       if (!isCurrent()) return;
       const created = {
         ...result.session,
         permissionMode: input.permissionMode,
       };
-      setSessions((current) => [
+      const initializationWarning = result.initializationErrorCode
+        ? "会话已经创建，但默认模型尚未初始化；请在 Kimi 恢复后重试"
+        : null;
+      const cachedSessions = sessionsByHostRef.current.get(targetHostId) ?? [];
+      const mergedSessions = [
         created,
-        ...current.filter(
+        ...cachedSessions.filter(
           (item) => item.upstreamSessionId !== created.upstreamSessionId,
         ),
-      ]);
+      ];
+      sessionsByHostRef.current.set(targetHostId, mergedSessions);
+      setSessions(mergedSessions);
       setSessionId(created.upstreamSessionId);
       setView("conversation");
       setNewSessionOpen(false);
@@ -2414,6 +2638,20 @@ export default function App() {
       ].slice(0, 20);
       localStorage.setItem(storageKey, JSON.stringify(next));
       setWorkspaceOptions(next);
+
+      try {
+        await activeChannel.rpc("sessions.permission.write", {
+          sessionId: created.upstreamSessionId,
+          permissionMode: input.permissionMode,
+        });
+      } catch (permissionError) {
+        if (isCurrent())
+          setError("会话已经创建，但权限模式初始化失败；可以稍后在会话中重试");
+        return;
+      }
+      if (!isCurrent()) return;
+      if (initializationWarning) setError(initializationWarning);
+      else setError(null);
     } catch (nextError) {
       if (!isCurrent()) return;
       const message = nextError instanceof Error ? nextError.message : "";
@@ -2830,6 +3068,7 @@ export default function App() {
       hostGenerationRef.current === generation &&
       oauthHostRef.current === targetHostId;
     oauthHostRef.current = targetHostId;
+    clearOAuthTimer();
     try {
       const flow = await activeChannel.rpc<OAuthFlow>("oauth.device.start", {
         region: oauthRegion,
@@ -2865,8 +3104,10 @@ export default function App() {
       hostGenerationRef.current !== generation
     )
       return;
+    clearOAuthTimer();
     oauthTimer.current = window.setTimeout(
       async () => {
+        oauthTimer.current = null;
         try {
           const next = await activeChannel.rpc<OAuthFlow | null>(
             "oauth.device.poll",
@@ -3738,7 +3979,7 @@ export default function App() {
                         setSelectedModel(model);
                         if (session)
                           composerDraftRef.current.set(
-                            session.upstreamSessionId,
+                            hostSessionKey(hostId, session.upstreamSessionId),
                             { model, thinkingLevel },
                           );
                       }}
@@ -3764,7 +4005,7 @@ export default function App() {
                         setThinkingLevel(nextThinkingLevel);
                         if (session)
                           composerDraftRef.current.set(
-                            session.upstreamSessionId,
+                            hostSessionKey(hostId, session.upstreamSessionId),
                             {
                               model: selectedModel,
                               thinkingLevel: nextThinkingLevel,
@@ -3843,15 +4084,23 @@ export default function App() {
         )}
 
         {view === "archive" && host && (
-          <ArchiveManager
-            sessions={archivedSessions}
-            loading={archiveLoading}
-            unavailable={!channel || host.state !== "online"}
-            busy={actionBusy}
-            query={archiveQuery}
-            onQueryChange={setArchiveQuery}
-            onRestore={(target) => void restoreSession(target)}
-          />
+          <Suspense
+            fallback={
+              <div className="offline-state" role="status">
+                正在加载归档视图…
+              </div>
+            }
+          >
+            <LazyArchiveManager
+              sessions={archivedSessions}
+              loading={archiveLoading}
+              unavailable={!channel || host.state !== "online"}
+              busy={actionBusy}
+              query={archiveQuery}
+              onQueryChange={setArchiveQuery}
+              onRestore={(target) => void restoreSession(target)}
+            />
+          </Suspense>
         )}
         {view === "archive" && !host && (
           <div className="offline-state" role="status">
@@ -3883,18 +4132,32 @@ export default function App() {
                 </p>
               </div>
             </div>
-            <TerminalPanel
-              hostId={host.hostId}
-              channel={terminalChannel}
-              demo={demo}
-              theme={theme}
-              platform={host.platform}
-              elevationAvailable={host.capabilities.includes("elevation")}
-              elevated={elevated}
-              connectionState={terminalPhase}
-              output={terminalOutput}
-              onElevatedChange={(next) => void changeElevation(next)}
-            />
+            <Suspense
+              fallback={
+                <div className="terminal-loading" role="status">
+                  正在加载终端…
+                </div>
+              }
+            >
+              <LazyTerminalPanel
+                hostId={host.hostId}
+                channel={terminalChannel}
+                demo={demo}
+                theme={theme}
+                platform={host.platform}
+                elevationAvailable={host.capabilities.includes("elevation")}
+                elevated={elevated}
+                connectionState={terminalPhase}
+                output={terminalOutput}
+                exit={terminalExit}
+                onElevatedChange={(next) => void changeElevation(next)}
+                onReopen={() => {
+                  setTerminalExit(null);
+                  setTerminalOutput(null);
+                  setTerminalGeneration((generation) => generation + 1);
+                }}
+              />
+            </Suspense>
           </div>
         )}
 
@@ -4121,27 +4384,26 @@ export default function App() {
         />
       )}
       {renameTarget && (
-        <div
-          className="dialog-scrim"
-          role="presentation"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !actionBusy) {
-              setRenameTarget(null);
-              setRenameTitle("");
-            }
+        <DialogShell
+          labelledBy="rename-dialog-title"
+          busy={actionBusy}
+          onClose={() => {
+            setRenameTarget(null);
+            setRenameTitle("");
           }}
         >
           <form
             className="dialog-card"
             onSubmit={(event) => {
               event.preventDefault();
+              if (actionBusy) return;
               void renameSession();
             }}
           >
             <div className="dialog-head">
               <div>
                 <p className="eyebrow">对话设置</p>
-                <h2>重命名对话</h2>
+                <h2 id="rename-dialog-title">重命名对话</h2>
               </div>
               <button
                 type="button"
@@ -4159,7 +4421,7 @@ export default function App() {
             <label>
               对话名称
               <input
-                autoFocus
+                data-dialog-initial-focus="true"
                 maxLength={200}
                 value={renameTitle}
                 onChange={(event) => setRenameTitle(event.target.value)}
@@ -4188,7 +4450,7 @@ export default function App() {
               </button>
             </div>
           </form>
-        </div>
+        </DialogShell>
       )}
       {pairingOpen && <PairingDialog onClose={() => setPairingOpen(false)} />}
     </div>

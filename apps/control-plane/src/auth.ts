@@ -427,23 +427,37 @@ export class AuthService {
   private provider(): Promise<oidc.Configuration> {
     if (!this.config.oidc)
       return Promise.reject(new Error("OIDC is not configured"));
-    this.discovery ??= oidc.discovery(
-      this.config.oidc.issuer,
-      this.config.oidc.clientId,
-      this.config.oidc.clientSecret,
+    if (this.discovery) return this.discovery;
+    const pending = Promise.resolve().then(() =>
+      oidc.discovery(
+        this.config.oidc!.issuer,
+        this.config.oidc!.clientId,
+        this.config.oidc!.clientSecret,
+      ),
     );
-    return this.discovery;
+    this.discovery = pending;
+    void pending.catch(() => {
+      if (this.discovery === pending) this.discovery = null;
+    });
+    return pending;
   }
 
   private elevationProvider(): Promise<oidc.Configuration> {
     if (!this.config.elevationOidc)
       return Promise.reject(new Error("Elevation OIDC is not configured"));
-    this.elevationDiscovery ??= oidc.discovery(
-      this.config.elevationOidc.issuer,
-      this.config.elevationOidc.clientId,
-      this.config.elevationOidc.clientSecret,
+    if (this.elevationDiscovery) return this.elevationDiscovery;
+    const pending = Promise.resolve().then(() =>
+      oidc.discovery(
+        this.config.elevationOidc!.issuer,
+        this.config.elevationOidc!.clientId,
+        this.config.elevationOidc!.clientSecret,
+      ),
     );
-    return this.elevationDiscovery;
+    this.elevationDiscovery = pending;
+    void pending.catch(() => {
+      if (this.elevationDiscovery === pending) this.elevationDiscovery = null;
+    });
+    return pending;
   }
 
   private safeReturnTo(value: string): string {

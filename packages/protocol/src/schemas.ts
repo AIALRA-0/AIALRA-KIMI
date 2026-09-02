@@ -168,6 +168,7 @@ export const AgentEnvelopeSchema = z.discriminatedUnion("type", [
     type: z.literal("agent.error"),
     requestId: z.string().uuid().nullable(),
     hostId: z.string().min(8).max(128).nullable(),
+    channelId: z.string().uuid().nullable().optional(),
     code: z.string().min(1).max(80),
     message: z.string().min(1).max(500),
   }),

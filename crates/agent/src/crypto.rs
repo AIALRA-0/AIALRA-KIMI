@@ -44,7 +44,7 @@ pub struct SecureChannel {
     pub grant_token: String,
     pub grant: CapabilityGrant,
     cipher: XChaCha20Poly1305,
-    inbound_sequence: Option<u64>,
+    expected_inbound_sequence: u64,
     outbound_sequence: u64,
 }
 
@@ -114,7 +114,7 @@ impl SecureChannel {
                 grant_token,
                 grant,
                 cipher: XChaCha20Poly1305::new((&key).into()),
-                inbound_sequence: None,
+                expected_inbound_sequence: 0,
                 outbound_sequence: 0,
             },
             agent_ephemeral_key,
@@ -126,10 +126,7 @@ impl SecureChannel {
         if frame.channel_id != self.id || frame.channel != self.kind {
             bail!("encrypted frame channel mismatch");
         }
-        if self
-            .inbound_sequence
-            .is_some_and(|sequence| frame.sequence <= sequence)
-        {
+        if frame.sequence != self.expected_inbound_sequence {
             bail!("replayed or out-of-order encrypted frame");
         }
         let nonce: [u8; 24] = URL_SAFE_NO_PAD
@@ -150,8 +147,13 @@ impl SecureChannel {
                 )
                 .map_err(|_| anyhow::anyhow!("encrypted frame authentication failed"))?,
         );
-        self.inbound_sequence = Some(frame.sequence);
-        serde_json::from_slice(&plaintext).context("invalid encrypted request payload")
+        let value =
+            serde_json::from_slice(&plaintext).context("invalid encrypted request payload")?;
+        self.expected_inbound_sequence = self
+            .expected_inbound_sequence
+            .checked_add(1)
+            .context("channel sequence exhausted")?;
+        Ok(value)
     }
 
     pub fn encrypt(&mut self, value: &Value) -> Result<EncryptedFrame> {
@@ -232,5 +234,54 @@ mod tests {
         )
         .unwrap();
         assert!(accepted.channel.allows("sessions.list"));
+    }
+
+    #[test]
+    fn decrypt_requires_the_next_inbound_sequence() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let browser_secret = StaticSecret::random_from_rng(OsRng);
+        let browser_public = URL_SAFE_NO_PAD.encode(PublicKey::from(&browser_secret).as_bytes());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = serde_json::json!({
+            "grantId": "grant-two",
+            "subject": "owner",
+            "hostId": "host-test-two",
+            "scopes": ["sessions.list"],
+            "issuedAt": now,
+            "expiresAt": now + 60,
+            "nonce": "nonce-two-with-enough-bytes"
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!(
+            "{}.{}",
+            encoded,
+            URL_SAFE_NO_PAD.encode(signing.sign(encoded.as_bytes()).to_bytes())
+        );
+        let accepted = SecureChannel::accept(
+            "00000000-0000-4000-8000-000000000002".to_owned(),
+            "kimi".to_owned(),
+            "host-test-two".to_owned(),
+            "owner".to_owned(),
+            &browser_public,
+            token,
+            &signing.verifying_key(),
+            &signing,
+        )
+        .unwrap();
+        let mut channel = accepted.channel;
+        let frame = channel
+            .encrypt(&serde_json::json!({ "request": true }))
+            .unwrap();
+        let mut gap = frame.clone();
+        gap.sequence = 1;
+        assert!(channel.decrypt(&gap).is_err());
+        assert_eq!(
+            channel.decrypt(&frame).unwrap(),
+            serde_json::json!({ "request": true })
+        );
+        assert!(channel.decrypt(&frame).is_err());
     }
 }

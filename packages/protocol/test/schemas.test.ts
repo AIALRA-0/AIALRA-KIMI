@@ -60,4 +60,19 @@ describe("public protocol", () => {
 
     expect(event).not.toHaveProperty("body");
   });
+
+  it("binds agent channel errors to their encrypted channel when available", () => {
+    const event = AgentEnvelopeSchema.parse({
+      type: "agent.error",
+      requestId: null,
+      hostId: "host-alpha",
+      channelId: "92b11e67-6f24-474f-9510-816e92a6a69f",
+      code: "channel_frame_rejected",
+      message: "encrypted channel frame was rejected",
+    });
+
+    expect(event).toMatchObject({
+      channelId: "92b11e67-6f24-474f-9510-816e92a6a69f",
+    });
+  });
 });

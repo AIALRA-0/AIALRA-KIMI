@@ -41,9 +41,9 @@ enum EventCommand {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Cursor {
-    sequence: u64,
+    sequence: Option<u64>,
     epoch: Option<String>,
     transcript_sequence: Option<u64>,
 }
@@ -84,13 +84,13 @@ impl KimiEventController {
                 session_id,
                 cursor: sequence
                     .map(|sequence| Cursor {
-                        sequence,
+                        sequence: Some(sequence),
                         epoch: epoch.clone(),
                         transcript_sequence,
                     })
                     .or_else(|| {
                         transcript_sequence.map(|transcript_sequence| Cursor {
-                            sequence: 0,
+                            sequence: None,
                             epoch,
                             transcript_sequence: Some(transcript_sequence),
                         })
@@ -197,24 +197,36 @@ async fn event_loop(
                         .or_else(|| value.pointer("/payload/sessionId").and_then(Value::as_str))
                         .or_else(|| value.pointer("/payload/session_id").and_then(Value::as_str));
                     if let Some(session_id) = session_id {
-                        if let Some(sequence) = value.get("seq").and_then(Value::as_u64) {
-                            cursors.insert(
-                                session_id.to_owned(),
+                        let is_transcript = matches!(
+                            value.get("type").and_then(Value::as_str),
+                            Some("transcript.ops" | "transcript.reset")
+                        );
+                        if is_transcript {
+                            if let Some(sequence) = value
+                                .pointer("/payload/seq")
+                                .and_then(Value::as_u64)
+                            {
+                                merge_cursor(
+                                    cursors.entry(session_id.to_owned()).or_default(),
+                                    Cursor {
+                                        sequence: None,
+                                        epoch: None,
+                                        transcript_sequence: Some(sequence),
+                                    },
+                                );
+                            }
+                        } else if let Some(sequence) = value.get("seq").and_then(Value::as_u64) {
+                            merge_cursor(
+                                cursors.entry(session_id.to_owned()).or_default(),
                                 Cursor {
-                                    sequence,
-                                    epoch: value.get("epoch").and_then(Value::as_str).map(str::to_owned),
-                                    transcript_sequence: cursors.get(session_id).and_then(|cursor| cursor.transcript_sequence),
+                                    sequence: Some(sequence),
+                                    epoch: value
+                                        .get("epoch")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                    transcript_sequence: None,
                                 },
                             );
-                        }
-                        if matches!(value.get("type").and_then(Value::as_str), Some("transcript.ops" | "transcript.reset"))
-                            && let Some(sequence) = value.pointer("/payload/seq").and_then(Value::as_u64)
-                        {
-                            cursors.entry(session_id.to_owned()).or_insert(Cursor {
-                                sequence: 0,
-                                epoch: None,
-                                transcript_sequence: None,
-                            }).transcript_sequence = Some(sequence);
                         }
                         if let Some(channels) = subscriptions.get(session_id) {
                             for channel_id in channels {
@@ -290,10 +302,14 @@ fn subscribe_frame(
         .iter()
         .filter(|(session_id, _)| subscriptions.contains_key(*session_id))
         .map(|(session_id, cursor)| {
-            (
-                session_id.clone(),
-                json!({ "seq": cursor.sequence, "epoch": cursor.epoch }),
-            )
+            let mut value = serde_json::Map::new();
+            if let Some(sequence) = cursor.sequence {
+                value.insert("seq".to_owned(), json!(sequence));
+            }
+            if let Some(epoch) = &cursor.epoch {
+                value.insert("epoch".to_owned(), json!(epoch));
+            }
+            (session_id.clone(), Value::Object(value))
         })
         .collect::<serde_json::Map<_, _>>();
     json!({
@@ -365,7 +381,7 @@ fn apply_command(
             cursor,
         } => {
             if let Some(cursor) = cursor {
-                cursors.insert(session_id.clone(), cursor);
+                merge_cursor(cursors.entry(session_id.clone()).or_default(), cursor);
             }
             subscriptions
                 .entry(session_id)
@@ -378,6 +394,40 @@ fn apply_command(
                 !channels.is_empty()
             });
         }
+    }
+}
+
+fn merge_cursor(existing: &mut Cursor, incoming: Cursor) {
+    let epoch_changed = matches!(
+        (&existing.epoch, &incoming.epoch),
+        (Some(current), Some(next)) if current != next
+    );
+
+    if epoch_changed || (existing.sequence.is_none() && incoming.sequence.is_some()) {
+        existing.sequence = incoming.sequence;
+        if incoming.epoch.is_some() {
+            existing.epoch = incoming.epoch;
+        }
+    } else if let Some(incoming_sequence) = incoming.sequence {
+        if existing
+            .sequence
+            .is_none_or(|current| incoming_sequence > current)
+        {
+            existing.sequence = Some(incoming_sequence);
+        }
+        if existing.epoch.is_none() {
+            existing.epoch = incoming.epoch;
+        }
+    } else if existing.epoch.is_none() && incoming.epoch.is_some() {
+        existing.epoch = incoming.epoch;
+    }
+
+    if incoming.transcript_sequence.is_some_and(|sequence| {
+        existing
+            .transcript_sequence
+            .is_none_or(|current| sequence > current)
+    }) {
+        existing.transcript_sequence = incoming.transcript_sequence;
     }
 }
 
@@ -427,7 +477,7 @@ mod tests {
                 channel_id: "channel-one".to_owned(),
                 session_id: "session-one".to_owned(),
                 cursor: Some(Cursor {
-                    sequence: 42,
+                    sequence: Some(42),
                     epoch: Some("epoch-one".to_owned()),
                     transcript_sequence: Some(7),
                 }),
@@ -450,5 +500,66 @@ mod tests {
             frame.pointer("/payload/cursors/session-one/epoch"),
             Some(&json!("epoch-one"))
         );
+    }
+
+    #[test]
+    fn transcript_cursor_never_invents_an_ordinary_zero_cursor() {
+        let mut subscriptions = HashMap::new();
+        let mut cursors = HashMap::new();
+        apply_command(
+            EventCommand::Subscribe {
+                channel_id: "channel-one".to_owned(),
+                session_id: "session-one".to_owned(),
+                cursor: Some(Cursor {
+                    sequence: None,
+                    epoch: None,
+                    transcript_sequence: Some(7),
+                }),
+            },
+            &mut subscriptions,
+            &mut cursors,
+        );
+
+        let frame = subscribe_frame(&subscriptions, &cursors);
+        assert_eq!(
+            frame.pointer("/payload/cursors/session-one"),
+            Some(&json!({}))
+        );
+        assert_eq!(
+            transcript_subscribe_frame("session-one", cursors.get("session-one"))
+                .pointer("/payload/transcript_since/main"),
+            Some(&json!(7))
+        );
+    }
+
+    #[test]
+    fn ordinary_and_transcript_cursors_merge_independently() {
+        let mut cursor = Cursor {
+            sequence: Some(12),
+            epoch: Some("epoch-one".to_owned()),
+            transcript_sequence: Some(4),
+        };
+        merge_cursor(
+            &mut cursor,
+            Cursor {
+                sequence: None,
+                epoch: None,
+                transcript_sequence: Some(9),
+            },
+        );
+        assert_eq!(cursor.sequence, Some(12));
+        assert_eq!(cursor.transcript_sequence, Some(9));
+
+        merge_cursor(
+            &mut cursor,
+            Cursor {
+                sequence: Some(3),
+                epoch: Some("epoch-two".to_owned()),
+                transcript_sequence: None,
+            },
+        );
+        assert_eq!(cursor.sequence, Some(3));
+        assert_eq!(cursor.epoch.as_deref(), Some("epoch-two"));
+        assert_eq!(cursor.transcript_sequence, Some(9));
     }
 }

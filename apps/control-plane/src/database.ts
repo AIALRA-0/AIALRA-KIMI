@@ -237,6 +237,12 @@ export class ControlPlaneDatabase {
       .run(hostId);
   }
 
+  markAllHostsOffline(): void {
+    this.raw
+      .prepare("UPDATE hosts SET state = 'offline' WHERE revoked_at IS NULL")
+      .run();
+  }
+
   revokeHost(hostId: string): boolean {
     const result = this.raw
       .prepare(

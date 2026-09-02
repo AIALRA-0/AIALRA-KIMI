@@ -13,8 +13,10 @@ interface TerminalPanelProps {
   elevationAvailable: boolean;
   elevated: boolean;
   output: { id: number; data: string } | null;
+  exit?: { reason: string; exitCode: number | null } | null;
   connectionState?: TerminalConnectionState;
   onElevatedChange(value: boolean): void;
+  onReopen(): void;
 }
 
 interface TerminalResumeState {
@@ -72,11 +74,14 @@ export function TerminalPanel({
   elevationAvailable,
   elevated,
   output,
+  exit = null,
   connectionState = demo ? "ready" : channel ? "ready" : "loading",
   onElevatedChange,
+  onReopen,
 }: TerminalPanelProps) {
   const container = useRef<HTMLDivElement>(null);
   const activeTerminal = useRef<Terminal | null>(null);
+  const terminalExited = useRef(false);
   const credentialRef = useRef<{ username: string; password: string } | null>(
     null,
   );
@@ -94,6 +99,7 @@ export function TerminalPanel({
 
   useEffect(() => {
     if (!container.current) return;
+    terminalExited.current = false;
     const terminal = new Terminal({
       cursorBlink: true,
       convertEol: true,
@@ -202,7 +208,7 @@ export function TerminalPanel({
       observer.disconnect();
       dataSubscription.dispose();
       resizeSubscription.dispose();
-      if (channel && !demo && elevated)
+      if (channel && !demo && elevated && !terminalExited.current)
         void channel.rpc("terminal.close", {}).catch(() => undefined);
       activeTerminal.current = null;
       terminal.dispose();
@@ -224,12 +230,25 @@ export function TerminalPanel({
 
   useEffect(() => {
     const textarea = activeTerminal.current?.textarea;
-    if (textarea) textarea.readOnly = !demo && connectionState !== "ready";
-  }, [connectionState, demo]);
+    if (textarea)
+      textarea.readOnly =
+        !demo && (connectionState !== "ready" || Boolean(exit));
+  }, [connectionState, demo, exit]);
 
   useEffect(() => {
     if (output) activeTerminal.current?.write(output.data);
   }, [output]);
+
+  useEffect(() => {
+    if (!exit) return;
+    terminalExited.current = true;
+    sessionStorage.removeItem(`aialra-terminal:${hostId}:${effectiveShell}`);
+    const terminal = activeTerminal.current;
+    if (terminal) {
+      const code = exit.exitCode === null ? "" : `（退出码 ${exit.exitCode}）`;
+      terminal.writeln(`\r\n终端已退出${code}`);
+    }
+  }, [effectiveShell, exit, hostId]);
 
   function changeElevation(next: boolean) {
     credentialRef.current = null;
@@ -350,6 +369,18 @@ export function TerminalPanel({
         </form>
       ) : (
         <div ref={container} className="terminal-surface" />
+      )}
+      {exit && (
+        <div className="terminal-exited" role="status">
+          <strong>终端已退出</strong>
+          <span>
+            {exit.reason}
+            {exit.exitCode === null ? "" : ` · 退出码 ${exit.exitCode}`}
+          </span>
+          <button type="button" onClick={onReopen}>
+            重新打开终端
+          </button>
+        </div>
       )}
     </section>
   );

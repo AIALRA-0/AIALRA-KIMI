@@ -438,20 +438,53 @@ impl KimiClient {
             .and_then(Value::as_str)
             .context("Kimi session creation omitted the session identity")?;
         validate_path_segment(session_id, "sessionId")?;
-        let config = self.data(Method::GET, "/api/v1/config", None).await?;
-        let default_model = config
+        let config = match self.data(Method::GET, "/api/v1/config", None).await {
+            Ok(config) => config,
+            Err(_) => {
+                return Ok(json!({
+                    "session": normalize_session(host_id, &created),
+                    "created": true,
+                    "modelInitialized": false,
+                    "initializationErrorCode": "config_unavailable"
+                }));
+            }
+        };
+        let Some(default_model) = config
             .get("default_model")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .context("Kimi has no configured default model")?;
-        let profile = self
+        else {
+            return Ok(json!({
+                "session": normalize_session(host_id, &created),
+                "created": true,
+                "modelInitialized": false,
+                "initializationErrorCode": "default_model_unavailable"
+            }));
+        };
+        let profile = match self
             .data(
                 Method::POST,
                 &format!("/api/v1/sessions/{session_id}/profile"),
                 Some(json!({ "agent_config": { "model": default_model } })),
             )
-            .await?;
-        Ok(json!({ "session": normalize_session(host_id, &profile) }))
+            .await
+        {
+            Ok(profile) => profile,
+            Err(_) => {
+                return Ok(json!({
+                    "session": normalize_session(host_id, &created),
+                    "created": true,
+                    "modelInitialized": false,
+                    "initializationErrorCode": "profile_initialization_failed"
+                }));
+            }
+        };
+        Ok(json!({
+            "session": normalize_session(host_id, &profile),
+            "created": true,
+            "modelInitialized": true,
+            "initializationErrorCode": Value::Null
+        }))
     }
 
     async fn snapshot(&self, body: Value) -> Result<Value> {

@@ -29,6 +29,7 @@ interface BrowserConnection {
       grant: string;
       grantId: string;
       channel: string;
+      openRequestId: string;
       lastSequence: number;
     }
   >;
@@ -363,6 +364,45 @@ export class RelayService {
       });
       return;
     }
+    if (envelope.type === "agent.error") {
+      let target: BrowserConnection | undefined;
+      let targetChannelId: string | undefined;
+      if (envelope.requestId) {
+        for (const candidate of this.browsers) {
+          const match = [...candidate.channels.entries()].find(
+            ([, channel]) =>
+              channel.hostId === connection.hostId &&
+              channel.openRequestId === envelope.requestId,
+          );
+          if (match) {
+            target = candidate;
+            targetChannelId = match[0];
+            break;
+          }
+        }
+      }
+      if (!target && envelope.channelId) {
+        for (const candidate of this.browsers) {
+          const channel = candidate.channels.get(envelope.channelId);
+          if (channel?.hostId === connection.hostId) {
+            target = candidate;
+            targetChannelId = envelope.channelId;
+            break;
+          }
+        }
+      }
+      if (!target || !targetChannelId) return;
+      if (envelope.channelId && targetChannelId !== envelope.channelId) return;
+      target.channels.delete(targetChannelId);
+      send(target.socket, {
+        type: "server.error",
+        ...(envelope.requestId ? { requestId: envelope.requestId } : {}),
+        channelId: targetChannelId,
+        code: envelope.code,
+        message: envelope.message,
+      });
+      return;
+    }
     if (
       envelope.type === "agent.channel.accept" ||
       envelope.type === "agent.frame"
@@ -461,6 +501,7 @@ export class RelayService {
           grant: envelope.grant,
           grantId: grant.grantId,
           channel: envelope.channel,
+          openRequestId: envelope.requestId,
           lastSequence: -1,
         });
       } else if (envelope.type === "browser.frame") {
@@ -474,6 +515,7 @@ export class RelayService {
         ) {
           return send(socket, {
             type: "server.error",
+            channelId: envelope.frame.channelId,
             code: "channel_validation_failed",
           });
         }
@@ -486,6 +528,8 @@ export class RelayService {
       const agent = this.agents.get(envelope.hostId);
       if (!agent) {
         if (envelope.type === "browser.channel.close") return;
+        if (envelope.type === "browser.channel.open")
+          connection.channels.delete(envelope.channelId);
         return send(socket, {
           type: "server.error",
           requestId:

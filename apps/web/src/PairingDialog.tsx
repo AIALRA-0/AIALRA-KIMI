@@ -2,6 +2,7 @@ import { Check, Copy, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { HostMode } from "@aialra-kimi/protocol";
 import { api } from "./api.js";
+import { DialogShell } from "./DialogShell.js";
 
 interface PairingCode {
   code: string;
@@ -22,17 +23,16 @@ export function PairingDialog({ onClose }: { onClose(): void }) {
   }, [displayName, mode, pairing]);
 
   return (
-    <div
-      className="dialog-scrim"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
+    <DialogShell
+      labelledBy="pairing-dialog-title"
+      busy={submitting}
+      onClose={onClose}
     >
       <form
         className="dialog-card pairing-dialog"
         onSubmit={(event) => {
           event.preventDefault();
+          if (submitting) return;
           setSubmitting(true);
           setError(null);
           void api
@@ -51,12 +51,15 @@ export function PairingDialog({ onClose }: { onClose(): void }) {
         <div className="dialog-head">
           <div>
             <p className="eyebrow">配对执行主机</p>
-            <h2>{pairing ? "在目标主机上运行一次" : "命名新主机"}</h2>
+            <h2 id="pairing-dialog-title">
+              {pairing ? "在目标主机上运行一次" : "命名新主机"}
+            </h2>
           </div>
           <button
             type="button"
             className="icon-button"
             onClick={onClose}
+            disabled={submitting}
             aria-label="关闭配对窗口"
           >
             <X size={17} />
@@ -106,7 +109,7 @@ export function PairingDialog({ onClose }: { onClose(): void }) {
             <label>
               显示名称
               <input
-                autoFocus
+                data-dialog-initial-focus="true"
                 value={displayName}
                 onChange={(event) => setDisplayName(event.target.value)}
                 placeholder="工作室电脑"
@@ -127,7 +130,7 @@ export function PairingDialog({ onClose }: { onClose(): void }) {
             <p className="dialog-note">主机只主动向外连接，不开放公网端口</p>
             {error && <p className="dialog-error">{error}</p>}
             <div className="dialog-actions">
-              <button type="button" onClick={onClose}>
+              <button type="button" onClick={onClose} disabled={submitting}>
                 取消
               </button>
               <button
@@ -140,6 +143,6 @@ export function PairingDialog({ onClose }: { onClose(): void }) {
           </>
         )}
       </form>
-    </div>
+    </DialogShell>
   );
 }

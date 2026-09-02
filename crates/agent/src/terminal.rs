@@ -27,6 +27,9 @@ use crate::{broker_protocol::BrokerCommand, elevated_broker_client::ElevatedBrok
 pub struct TerminalOutput {
     pub terminal_id: String,
     pub data: String,
+    pub exited: bool,
+    pub exit_reason: Option<String>,
+    pub exit_code: Option<i32>,
 }
 
 struct TerminalSession {
@@ -327,6 +330,20 @@ impl TerminalManager {
         session.channel_id.clone()
     }
 
+    pub fn finish(&mut self, terminal_id: &str) {
+        #[cfg(windows)]
+        if let Some(session) = self.broker_sessions.remove(terminal_id) {
+            session.stop.store(true, Ordering::SeqCst);
+            let _ = session.client.call(BrokerCommand::Close {
+                terminal_id: session.broker_terminal_id,
+            });
+            return;
+        }
+        if let Some(mut session) = self.sessions.remove(terminal_id) {
+            let _ = session.child.wait();
+        }
+    }
+
     pub fn reap_expired(&mut self) {
         let now = Instant::now();
         let expired = self
@@ -445,18 +462,29 @@ impl TerminalManager {
                                 .get("cursor")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(cursor);
-                            if let Some(data) = response.get("data").and_then(Value::as_str)
-                                && !data.is_empty()
+                            let data = response
+                                .get("data")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let exited =
+                                response.get("exited").and_then(Value::as_bool) == Some(true);
+                            if (!data.is_empty() || exited)
                                 && output
                                     .blocking_send(TerminalOutput {
                                         terminal_id: poll_terminal_id.clone(),
                                         data: data.to_owned(),
+                                        exited,
+                                        exit_reason: exited.then(|| "process_exited".to_owned()),
+                                        exit_code: response
+                                            .get("exitCode")
+                                            .and_then(Value::as_i64)
+                                            .and_then(|value| i32::try_from(value).ok()),
                                     })
                                     .is_err()
                             {
                                 break;
                             }
-                            if response.get("exited").and_then(Value::as_bool) == Some(true) {
+                            if exited {
                                 break;
                             }
                         }
@@ -561,6 +589,9 @@ fn copy_output(reader: &mut dyn Read, output: &mpsc::Sender<TerminalOutput>, ter
                     .blocking_send(TerminalOutput {
                         terminal_id: terminal_id.to_owned(),
                         data: String::from_utf8_lossy(&buffer[..count]).into_owned(),
+                        exited: false,
+                        exit_reason: None,
+                        exit_code: None,
                     })
                     .is_err()
                 {
@@ -569,4 +600,11 @@ fn copy_output(reader: &mut dyn Read, output: &mpsc::Sender<TerminalOutput>, ter
             }
         }
     }
+    let _ = output.blocking_send(TerminalOutput {
+        terminal_id: terminal_id.to_owned(),
+        data: String::new(),
+        exited: true,
+        exit_reason: Some("process_exited".to_owned()),
+        exit_code: None,
+    });
 }

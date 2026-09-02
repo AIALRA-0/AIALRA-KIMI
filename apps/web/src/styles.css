@@ -2744,6 +2744,9 @@ button:disabled {
   background: #000a;
   backdrop-filter: blur(4px);
 }
+.dialog-shell {
+  width: min(480px, 100%);
+}
 .dialog-card {
   width: min(480px, 100%);
   display: grid;
@@ -2753,6 +2756,9 @@ button:disabled {
   border-radius: 16px;
   background: var(--panel-raised);
   box-shadow: 0 30px 100px #000a;
+}
+.dialog-shell > .dialog-card {
+  width: 100%;
 }
 .dialog-head {
   display: flex;

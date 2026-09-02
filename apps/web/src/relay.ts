@@ -3,9 +3,10 @@ import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { randomBytes } from "@noble/hashes/utils.js";
-import type {
-  AgentOperation,
-  EncryptedChannelFrame,
+import {
+  EncryptedChannelFrameSchema,
+  type AgentOperation,
+  type EncryptedChannelFrame,
 } from "@aialra-kimi/protocol";
 import { api, csrfToken } from "./api.js";
 import { relayRetryDelay } from "./recovery-policy.js";
@@ -53,7 +54,8 @@ interface ChannelState {
   identityKey: Uint8Array;
   key: Uint8Array | null;
   closed: boolean;
-  sequence: number;
+  outboundSequence: number;
+  expectedInboundSequence: number;
   ready: Promise<void>;
   resolveReady(): void;
   rejectReady(error: Error): void;
@@ -147,7 +149,8 @@ export class BrowserRelay {
       identityKey: pemRawKey(identity.publicKeyPem),
       key: null,
       closed: false,
-      sequence: 0,
+      outboundSequence: 0,
+      expectedInboundSequence: 0,
       ready,
       resolveReady,
       rejectReady,
@@ -188,7 +191,7 @@ export class BrowserRelay {
       throw new Error("加密通道已断开，正在恢复");
     if (!state.key) throw new Error("通道密钥不可用");
     const requestId = crypto.randomUUID();
-    const sequence = state.sequence++;
+    const sequence = state.outboundSequence++;
     const nonce = randomBytes(24);
     const aad = encoder.encode(
       `${state.channelId}\n${state.channel}\n${sequence}`,
@@ -318,6 +321,10 @@ export class BrowserRelay {
     if (message.type === "agent.channel.accept") {
       const channel = this.channels.get(String(message.channelId));
       if (!channel) return;
+      if (String(message.requestId) !== channel.openRequestId) {
+        channel.rejectReady(new Error("代理通道握手请求不匹配"));
+        return;
+      }
       const agentPublicKey = String(message.agentEphemeralKey);
       const canonical = [
         channel.channelId,
@@ -351,9 +358,44 @@ export class BrowserRelay {
       return;
     }
     if (message.type === "agent.frame") {
-      const frame = message.frame as EncryptedChannelFrame;
-      const channel = this.channels.get(frame.channelId);
-      if (!channel?.key) return;
+      const parsed = EncryptedChannelFrameSchema.safeParse(message.frame);
+      const candidate =
+        message.frame && typeof message.frame === "object"
+          ? (message.frame as { channelId?: unknown })
+          : null;
+      const channelId =
+        typeof candidate?.channelId === "string" ? candidate.channelId : null;
+      const channel = channelId ? this.channels.get(channelId) : undefined;
+      if (!channel) return;
+      if (!parsed.success) {
+        this.failChannel(
+          channel,
+          new Error("加密通道帧格式无效"),
+          "channel.integrity_error",
+        );
+        return;
+      }
+      const frame: EncryptedChannelFrame = parsed.data;
+      if (
+        !channel.key ||
+        channel.hostId !== String(message.hostId) ||
+        frame.channel !== channel.channel
+      ) {
+        this.failChannel(
+          channel,
+          new Error("加密通道绑定不匹配"),
+          "channel.integrity_error",
+        );
+        return;
+      }
+      if (frame.sequence !== channel.expectedInboundSequence) {
+        this.failChannel(
+          channel,
+          new Error("加密通道接收序号不连续"),
+          "channel.integrity_error",
+        );
+        return;
+      }
       try {
         const nonce = unbase64url(frame.nonce);
         const sealed = new Uint8Array([
@@ -369,6 +411,7 @@ export class BrowserRelay {
         const value = JSON.parse(decoder.decode(plaintext)) as
           | RpcReply
           | { event: unknown };
+        channel.expectedInboundSequence += 1;
         if ("requestId" in value) {
           const pending = channel.pending.get(value.requestId);
           if (!pending) return;
@@ -379,7 +422,11 @@ export class BrowserRelay {
           channel.onEvent(value.event);
         }
       } catch {
-        channel.onEvent({ type: "channel.integrity_error" });
+        this.failChannel(
+          channel,
+          new Error("加密通道认证失败"),
+          "channel.integrity_error",
+        );
       }
       return;
     }
@@ -391,13 +438,27 @@ export class BrowserRelay {
           (channel) => channel.openRequestId === requestId,
         );
         if (opening) {
-          opening.rejectReady(
-            new RelayOpenError(
-              String(message.code ?? "unknown"),
-              message.code === "host_offline"
-                ? "主机已离线"
-                : `代理通道连接失败（${String(message.code ?? "unknown")}）`,
-            ),
+          const error = new RelayOpenError(
+            String(message.code ?? "unknown"),
+            message.code === "host_offline"
+              ? "主机已离线"
+              : `代理通道连接失败（${String(message.code ?? "unknown")}）`,
+          );
+          if (opening.key)
+            this.failChannel(opening, error, "channel.disconnected");
+          else opening.rejectReady(error);
+          return;
+        }
+      }
+      const channelId =
+        typeof message.channelId === "string" ? message.channelId : null;
+      if (channelId) {
+        const channel = this.channels.get(channelId);
+        if (channel) {
+          this.failChannel(
+            channel,
+            new Error(String(message.message ?? message.code ?? "通道失败")),
+            "channel.disconnected",
           );
           return;
         }
@@ -493,6 +554,18 @@ export class BrowserRelay {
         }),
       );
     }
+  }
+
+  private failChannel(
+    state: ChannelState,
+    error: Error,
+    eventType: "channel.integrity_error" | "channel.disconnected",
+  ): void {
+    if (!this.channels.has(state.channelId)) return;
+    state.onEvent({ type: eventType });
+    if (eventType === "channel.integrity_error")
+      state.onEvent({ type: "channel.disconnected" });
+    this.discardChannel(state, error, true);
   }
 }
 

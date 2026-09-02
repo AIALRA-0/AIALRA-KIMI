@@ -106,6 +106,32 @@ describe("control-plane database", () => {
     expect(database.listHosts()).toEqual([]);
   });
 
+  it("does not restore stale online state after a process restart", () => {
+    const { database } = createDatabase();
+    for (const hostId of ["host-alpha", "host-bravo"]) {
+      database.registerHost({
+        hostId,
+        displayName: hostId,
+        mode: "remote",
+        platform: "windows",
+        publicKey: "public-key",
+        agentVersion: "0.1.0",
+      });
+      database.updateHostStatus({
+        hostId,
+        state: "online",
+        agentVersion: "0.1.0",
+        kimiVersion: "0.39.1",
+      });
+    }
+    database.revokeHost("host-bravo");
+    database.markAllHostsOffline();
+    expect(database.listHosts()).toEqual([
+      expect.objectContaining({ hostId: "host-alpha", state: "offline" }),
+    ]);
+    expect(database.getHostIdentity("host-bravo")?.revoked).toBe(true);
+  });
+
   it("keeps the new-session default separate from existing sessions", () => {
     const { database } = createDatabase();
     database.registerHost({
