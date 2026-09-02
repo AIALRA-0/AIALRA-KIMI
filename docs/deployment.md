@@ -11,7 +11,7 @@ Use a separate private operations repository for host inventory, secret referenc
 - A Linux VPS with systemd, Nginx, SQLite, and TLS certificates
 - Node.js 24.15.x and pnpm 10.33.x for builds
 - Rust 1.95.x for host-agent builds
-- An OIDC provider supporting Authorization Code, PKCE, owner-group claims, password reauthentication, and MFA
+- An OIDC provider supporting Authorization Code, PKCE, owner-group claims, and password reauthentication; MFA remains an identity-provider policy when enabled
 - Optional Cloudflare proxying with WebSocket support, strict TLS, WAF, handshake limits, and cache bypass
 - A release-signing or provenance mechanism whose verification happens before extraction
 
@@ -34,7 +34,7 @@ Record source revision, toolchain versions, upstream lock hash, artifact SHA-256
 
 Create two OIDC clients: one for ordinary access and one for terminal elevation
 
-Both clients must use exact HTTPS callback URLs, owner-group authorization, password reauthentication, and MFA
+Both clients must use exact HTTPS callback URLs and owner-group authorization. Configure MFA in the identity provider according to its policy; the application separately requests password reauthentication for elevation and validates the returned recent-authentication time
 
 Map the resulting values to `.env.example`, store client secrets in systemd credentials, and keep `DEV_AUTH_BYPASS=0`
 
@@ -83,7 +83,7 @@ TLS private keys can be reissued and should not be duplicated into the applicati
 
 ## 9 Upgrade and rollback
 
-Before promotion, refresh `upstream.lock.json` in a review branch and run contracts, browser flows, agent tests, and security regression checks
+Before promotion, run `pnpm check:upstream` and the contract, browser, agent, and security regression checks. The upstream workflow is read-only: an unchanged lock succeeds, while a real upstream difference is reported for an intentional update directly on `main`; it does not create a review branch or auto-promote anything
 
 Deploy the same verified artifact to a new immutable directory, switch `current`, restart, and wait for readiness
 

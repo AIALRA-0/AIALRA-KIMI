@@ -12,7 +12,7 @@
       "id": "conversation-transcript-v2",
       "status": "native",
       "operations": ["sessions.transcript.read", "sessions.transcript.resume"],
-      "evidence": "ConversationTimeline.tsx renders official transcript turns, parts, offsets, and states"
+      "evidence": "TranscriptTimeline.tsx renders official transcript turns, parts, offsets, and states"
     },
     {
       "id": "reasoning-and-progress",
@@ -103,7 +103,7 @@
       "id": "markdown-and-code",
       "status": "native",
       "operations": ["sessions.transcript.read"],
-      "evidence": "MarkdownRenderer.tsx handles prose, links, tables, fenced code, and media"
+      "evidence": "MessageBody.tsx handles prose, links, tables, fenced code, and media"
     },
     {
       "id": "approvals-and-questions",

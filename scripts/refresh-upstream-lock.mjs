@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -61,26 +61,34 @@ if (!commit || !/^[0-9a-f]{40}$/u.test(commit)) {
 }
 
 const temporary = await mkdtemp(join(tmpdir(), "aialra-kimi-upstream-"));
-const linuxAsset = manifest.platforms["linux-x64"];
-const linuxAssetUrl = assets.get(linuxAsset.filename);
-if (!linuxAssetUrl) throw new Error("The Kimi release omitted linux-x64");
-const archive = join(temporary, linuxAsset.filename);
-const archiveResponse = await fetch(linuxAssetUrl);
+const platformKey = process.platform === "win32" ? "win32-x64" : "linux-x64";
+const platformAsset = manifest.platforms[platformKey];
+if (!platformAsset) throw new Error(`The Kimi release omitted ${platformKey}`);
+const platformAssetUrl = assets.get(platformAsset.filename);
+if (!platformAssetUrl)
+  throw new Error(`The Kimi release omitted ${platformKey}`);
+const archive = join(temporary, platformAsset.filename);
+const archiveResponse = await fetch(platformAssetUrl);
 if (!archiveResponse.ok) {
   throw new Error(
-    `Kimi linux-x64 asset returned HTTP ${archiveResponse.status}`,
+    `Kimi ${platformKey} asset returned HTTP ${archiveResponse.status}`,
   );
 }
 const archiveBytes = Buffer.from(await archiveResponse.arrayBuffer());
 const archiveHash = createHash("sha256").update(archiveBytes).digest("hex");
-if (archiveHash !== linuxAsset.checksum) {
+if (archiveHash !== platformAsset.checksum) {
   throw new Error(
-    "Kimi linux-x64 asset did not match the release manifest checksum",
+    `Kimi ${platformKey} asset did not match the release manifest checksum`,
   );
 }
 await writeFile(archive, archiveBytes, { mode: 0o600 });
 const extracted = join(temporary, "extracted");
-execFileSync("unzip", ["-q", archive, "-d", extracted]);
+await mkdir(extracted);
+if (process.platform === "win32") {
+  execFileSync("tar", ["-xf", archive, "-C", extracted]);
+} else {
+  execFileSync("unzip", ["-q", archive, "-d", extracted]);
+}
 
 async function findKimi(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -88,7 +96,7 @@ async function findKimi(directory) {
     if (entry.isDirectory()) {
       const nested = await findKimi(path);
       if (nested) return nested;
-    } else if (entry.name === "kimi") {
+    } else if (entry.name === "kimi" || entry.name === "kimi.exe") {
       return path;
     }
   }
@@ -97,8 +105,8 @@ async function findKimi(directory) {
 
 const executable = await findKimi(extracted);
 if (!executable)
-  throw new Error("The Kimi linux-x64 asset omitted the executable");
-execFileSync("chmod", ["0700", executable]);
+  throw new Error(`The Kimi ${platformKey} asset omitted the executable`);
+if (process.platform !== "win32") execFileSync("chmod", ["0700", executable]);
 const kimiHome = join(temporary, "home");
 const port = await new Promise((resolvePort, reject) => {
   const server = createServer();

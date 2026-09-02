@@ -26,25 +26,25 @@ An authenticated single owner can control only enrolled hosts and scoped operati
 
 ## 4 Threats and controls
 
-| Threat                         | Primary controls                                                       | Residual risk                                            |
-| ------------------------------ | ---------------------------------------------------------------------- | -------------------------------------------------------- |
-| Anonymous or non-owner access  | OIDC Code + PKCE, owner-group policy, MFA, CSRF checks                 | Identity-provider compromise                             |
-| Stolen or replayed grant       | Short expiry, host and scope binding, nonce store, sequence checks     | Compromised endpoint before expiry                       |
-| Forged host                    | Ed25519 challenge, local protected key, revocation                     | Full compromise of the enrolled OS account               |
-| Relay reads content            | Ephemeral X25519 and XChaCha20-Poly1305 frames                         | Malicious frontend can read plaintext before encryption  |
-| Cross-host confusion           | `hostId` in every session reference and grant                          | Implementation defects require contract regression tests |
-| SSRF or local pivot            | Allowlisted Kimi operations, loopback Kimi port, no generic HTTP proxy | Vulnerability in an allowed upstream method              |
-| Terminal password leakage      | Encrypted input, no persistence or logging, browser-storage ban        | Browser or host compromise at input time                 |
-| Privileged process survives    | Idle timeout, maximum lifetime, disconnect kill, separate broker       | Operating-system failure or broker compromise            |
-| XSS and supply-chain injection | CSP, no third-party scripts, SRI, immutable signed artifacts           | Compromised build or signing authority                   |
-| Archive traversal              | Path validation before extraction and immutable release target         | Vulnerability in extraction tooling                      |
-| Sensitive logs                 | Category-only audit schema and secret-pattern checks                   | New logging code bypasses the schema                     |
+| Threat                         | Primary controls                                                           | Residual risk                                            |
+| ------------------------------ | -------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Anonymous or non-owner access  | OIDC Code + PKCE, owner-group policy, IdP MFA when configured, CSRF checks | Identity-provider compromise                             |
+| Stolen or replayed grant       | Short expiry, host and scope binding, nonce store, sequence checks         | Compromised endpoint before expiry                       |
+| Forged host                    | Ed25519 challenge, local protected key, revocation                         | Full compromise of the enrolled OS account               |
+| Relay reads content            | Ephemeral X25519 and XChaCha20-Poly1305 frames                             | Malicious frontend can read plaintext before encryption  |
+| Cross-host confusion           | `hostId` in every session reference and grant                              | Implementation defects require contract regression tests |
+| SSRF or local pivot            | Allowlisted Kimi operations, loopback Kimi port, no generic HTTP proxy     | Vulnerability in an allowed upstream method              |
+| Terminal password leakage      | Encrypted input, no persistence or logging, browser-storage ban            | Browser or host compromise at input time                 |
+| Privileged process survives    | Idle timeout, maximum lifetime, disconnect kill, separate broker           | Operating-system failure or broker compromise            |
+| XSS and supply-chain injection | CSP, no third-party scripts, SRI, immutable signed artifacts               | Compromised build or signing authority                   |
+| Archive traversal              | Path validation before extraction and immutable release target             | Vulnerability in extraction tooling                      |
+| Sensitive logs                 | Category-only audit schema and secret-pattern checks                       | New logging code bypasses the schema                     |
 
 ## 5 Elevation boundary
 
 Ordinary access never implies terminal elevation
 
-Elevation requires a separate short-lived OIDC flow with password and MFA reauthentication
+Elevation requires a separate short-lived OIDC flow with password reauthentication and a recent-authentication check; any MFA step is enforced by the identity provider's policy
 
 Linux starts `sudo -k -i` on the target host; Windows delegates terminal creation to a separately installed LocalSystem broker over a local authenticated channel
 

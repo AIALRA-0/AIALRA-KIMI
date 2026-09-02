@@ -210,17 +210,17 @@ See [Deployment](docs/deployment.md) for configuration and acceptance gates
 
 ## 8. Validation status
 
-These counts come from a local check of the current v0.1.0 source on 2026-09-01; `main` also passed GitHub CI with the pinned toolchain, but these results do not imply that every production environment has completed cold-boot acceptance
+The table lists the current validation entry points and their evidence boundaries without embedding fast-expiring test counts; every release must use the current revision's local output, GitHub CI, and private deployment receipt. These checks do not imply that every production environment has completed cold-boot acceptance
 
 <div align="center">
 
-| Target                       | Method                  | Current result                          | Evidence boundary                                         |
-| ---------------------------- | ----------------------- | --------------------------------------- | --------------------------------------------------------- |
-| TypeScript workspace         | `pnpm test`             | 56 tests passed                         | Protocol, crypto, identity, database, and UI state models |
-| Rust host agent              | `cargo test`            | 19 Windows tests passed                 | Windows and Linux CI both passed on `main`                |
-| Desktop and mobile browser   | `pnpm test:e2e`         | 22 passed and 2 platform-specific skips | Chromium synthetic core flows                             |
-| README synthetic screenshots | `pnpm docs:screenshots` | 4 scenarios passed                      | Desktop light, desktop dark, mobile, and pairing flow     |
-| Upstream compatibility lock  | `pnpm check:upstream`   | Pinned 0.39.1 and protocol hashes       | Kimi Server API remains experimental upstream             |
+| Target                       | Method                  | Current result                      | Evidence boundary                                         |
+| ---------------------------- | ----------------------- | ----------------------------------- | --------------------------------------------------------- |
+| TypeScript workspace         | `pnpm test`             | Use current command output          | Protocol, crypto, identity, database, and UI state models |
+| Rust host agent              | `cargo test`            | Use current command output          | Windows and Linux targets checked separately              |
+| Desktop and mobile browser   | `pnpm test:e2e`         | Use current command output          | Chromium synthetic core flows                             |
+| README synthetic screenshots | `pnpm docs:screenshots` | Use current command output          | Desktop light, desktop dark, mobile, and pairing flow     |
+| Upstream compatibility lock  | `pnpm check:upstream`   | Use current lock and command output | Kimi Server API remains experimental upstream             |
 
 Table 8.1. Current validation scope
 
