@@ -30,7 +30,20 @@ jobs:
           pnpm --filter @aialra-kimi/control-plane --prod deploy --legacy artifacts/stage/control-plane
           cp -R apps/web/dist artifacts/stage/web
           cp LICENSE THIRD_PARTY_NOTICES.md upstream.lock.json artifacts/stage/
+          jq -n \
+            --arg revision "${GITHUB_SHA}" \
+            --arg node "v24.15.0" \
+            --arg pnpm "10.33.4" \
+            --arg upstream_version "$(jq -er '.version' upstream.lock.json)" \
+            '{
+              sourceRevision: $revision,
+              dirtyCandidate: false,
+              node: $node,
+              pnpm: $pnpm,
+              upstreamVersion: $upstream_version
+            }' > artifacts/stage/BUILD-METADATA.json
           rm -rf artifacts/stage/control-plane/src artifacts/stage/control-plane/test artifacts/stage/control-plane/scripts
+          find artifacts/stage -type f -name '*.map' -delete
           tar -C artifacts/stage -czf artifacts/aialra-kimi-control-plane-linux-x64.tar.gz .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -57,14 +70,31 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p artifacts/agent
-          cp target/release/aialra-kimi-agent LICENSE THIRD_PARTY_NOTICES.md artifacts/agent/
+          cp target/release/aialra-kimi-agent LICENSE THIRD_PARTY_NOTICES.md upstream.lock.json artifacts/agent/
+          jq -n \
+            --arg revision "${GITHUB_SHA}" \
+            --arg rust "$(rustc --version)" \
+            --arg upstream_version "$(jq -er '.version' upstream.lock.json)" \
+            '{
+              sourceRevision: $revision,
+              dirtyCandidate: false,
+              rust: $rust,
+              upstreamVersion: $upstream_version
+            }' > artifacts/agent/BUILD-METADATA.json
           tar -C artifacts/agent -czf artifacts/${{ matrix.artifact }} .
       - name: Package Windows agent and elevated broker
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path artifacts/agent | Out-Null
-          Copy-Item target/release/aialra-kimi-agent.exe,target/release/aialra-kimi-elevated-broker.exe,LICENSE,THIRD_PARTY_NOTICES.md artifacts/agent/
+          Copy-Item target/release/aialra-kimi-agent.exe,target/release/aialra-kimi-elevated-broker.exe,LICENSE,THIRD_PARTY_NOTICES.md,upstream.lock.json artifacts/agent/
+          $upstream = Get-Content -Raw -LiteralPath upstream.lock.json | ConvertFrom-Json
+          [ordered]@{
+            sourceRevision = '${{ github.sha }}'
+            dirtyCandidate = $false
+            rust = (rustc --version)
+            upstreamVersion = $upstream.version
+          } | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath artifacts/agent/BUILD-METADATA.json
           Compress-Archive -Path artifacts/agent/* -DestinationPath artifacts/${{ matrix.artifact }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
