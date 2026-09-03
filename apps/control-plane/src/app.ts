@@ -126,7 +126,7 @@ export async function createApp(config: AppConfig): Promise<AppServices> {
 
   app.get("/api/v1/hosts", async (request, reply) => {
     if (!(await auth.requireOwner(request, reply))) return;
-    return { hosts: db.listHosts() };
+    return { hosts: relay.listHosts() };
   });
 
   app.post("/api/v1/pairing-codes", async (request, reply) => {

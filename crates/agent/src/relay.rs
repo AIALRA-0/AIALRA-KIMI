@@ -1,5 +1,7 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -17,7 +19,7 @@ use tokio::{
     time::{MissedTickBehavior, timeout},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -37,6 +39,118 @@ const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RELAY_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ACTIVE_CHANNELS: usize = 16;
 const MAX_RELAY_SILENCE: Duration = Duration::from_secs(45);
+
+#[derive(Default)]
+struct HeartbeatTracker {
+    outstanding: HashSet<u64>,
+    sent: u64,
+    acknowledged: u64,
+}
+
+impl HeartbeatTracker {
+    fn sent(&mut self, sequence: u64) {
+        self.outstanding.insert(sequence);
+        self.sent += 1;
+    }
+
+    fn acknowledge(&mut self, sequence: u64) -> bool {
+        if !self.outstanding.remove(&sequence) {
+            return false;
+        }
+        self.acknowledged += 1;
+        true
+    }
+}
+
+struct RelayConnectionTelemetry {
+    connected_at: Instant,
+    host_tag: u64,
+    completed: AtomicBool,
+    heartbeat_sent: AtomicU64,
+    heartbeat_acknowledged: AtomicU64,
+    heartbeat_outstanding: AtomicU64,
+    last_heartbeat_ack_ms: AtomicU64,
+}
+
+impl RelayConnectionTelemetry {
+    fn new(connected_at: Instant, host_tag: u64) -> Self {
+        Self {
+            connected_at,
+            host_tag,
+            completed: AtomicBool::new(false),
+            heartbeat_sent: AtomicU64::new(0),
+            heartbeat_acknowledged: AtomicU64::new(0),
+            heartbeat_outstanding: AtomicU64::new(0),
+            last_heartbeat_ack_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, tracker: &HeartbeatTracker, last_heartbeat_ack: Instant) {
+        self.heartbeat_sent.store(tracker.sent, Ordering::Relaxed);
+        self.heartbeat_acknowledged
+            .store(tracker.acknowledged, Ordering::Relaxed);
+        self.heartbeat_outstanding
+            .store(tracker.outstanding.len() as u64, Ordering::Relaxed);
+        let elapsed_ms = last_heartbeat_ack
+            .saturating_duration_since(self.connected_at)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.last_heartbeat_ack_ms
+            .store(elapsed_ms, Ordering::Relaxed);
+    }
+}
+
+impl Drop for RelayConnectionTelemetry {
+    fn drop(&mut self) {
+        let connection_ms = self.connected_at.elapsed().as_millis();
+        let last_ack_ms = self.last_heartbeat_ack_ms.load(Ordering::Relaxed);
+        let last_ack_age_ms = connection_ms.saturating_sub(u128::from(last_ack_ms));
+        let heartbeat_sent = self.heartbeat_sent.load(Ordering::Relaxed);
+        let heartbeat_acknowledged = self.heartbeat_acknowledged.load(Ordering::Relaxed);
+        let heartbeat_outstanding = self.heartbeat_outstanding.load(Ordering::Relaxed);
+        if self.completed.load(Ordering::Relaxed) {
+            info!(
+                host_tag = self.host_tag,
+                phase = "closed",
+                connection_ms,
+                last_heartbeat_ack_age_ms = last_ack_age_ms,
+                heartbeat_sent,
+                heartbeat_acknowledged,
+                heartbeat_outstanding,
+                "relay connection telemetry"
+            );
+        } else {
+            warn!(
+                host_tag = self.host_tag,
+                phase = "failed",
+                connection_ms,
+                last_heartbeat_ack_age_ms = last_ack_age_ms,
+                heartbeat_sent,
+                heartbeat_acknowledged,
+                heartbeat_outstanding,
+                "relay connection telemetry"
+            );
+        }
+    }
+}
+
+fn accept_heartbeat_ack(
+    tracker: &mut HeartbeatTracker,
+    sequence: u64,
+    relay_backoff: &mut Duration,
+) -> bool {
+    if !tracker.acknowledge(sequence) {
+        return false;
+    }
+    *relay_backoff = Duration::from_secs(1);
+    true
+}
+
+fn host_observation_tag(host_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    host_id.hash(&mut hasher);
+    hasher.finish()
+}
 
 struct AbortOnDrop<T>(JoinHandle<T>);
 
@@ -106,7 +220,10 @@ pub async fn enroll(
                 kimi_port,
             }
             .save()?;
-            info!(host_id, "agent enrollment completed");
+            info!(
+                host_tag = host_observation_tag(host_id),
+                "agent enrollment completed"
+            );
             return Ok(());
         }
         if value.get("type").and_then(Value::as_str) == Some("agent.error") {
@@ -141,11 +258,16 @@ pub async fn run_forever(config: AgentConfig, identity: HostIdentity) -> Result<
                         probe,
                         Arc::clone(&terminals),
                         &mut terminal_rx,
+                        &mut relay_backoff,
                     )
                     .await
                     {
                         Ok(()) => relay_backoff = Duration::from_secs(1),
-                        Err(error) => warn!(error = %error, "relay connection ended"),
+                        Err(error) => warn!(
+                            reason_class = relay_error_category(&error),
+                            relay_backoff_seconds = relay_backoff.as_secs(),
+                            "relay connection ended"
+                        ),
                     }
                     {
                         let mut terminals = terminals.lock().await;
@@ -175,7 +297,16 @@ async fn run_connection(
     probe: KimiProbe,
     terminals: Arc<Mutex<TerminalManager>>,
     terminal_rx: &mut mpsc::Receiver<TerminalOutput>,
+    relay_backoff: &mut Duration,
 ) -> Result<()> {
+    let connected_at = Instant::now();
+    let host_tag = host_observation_tag(&config.host_id);
+    let telemetry = RelayConnectionTelemetry::new(connected_at, host_tag);
+    info!(
+        host_tag,
+        phase = "connect_start",
+        "relay connection attempt"
+    );
     let (socket, _) = connect_async(agent_websocket_url(&config.server_url)?.as_str())
         .await
         .context("failed to connect to the relay")?;
@@ -203,7 +334,8 @@ async fn run_connection(
     heartbeat_watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut authenticated = false;
     let mut compatible = false;
-    let mut last_relay_activity = Instant::now();
+    let mut last_heartbeat_ack = Instant::now();
+    let mut heartbeat_tracker = HeartbeatTracker::default();
     let (heartbeat_state_tx, heartbeat_state_rx) = watch::channel(false);
     let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel::<Result<KimiHeartbeat, String>>(4);
     let heartbeat_client = kimi.clone();
@@ -260,7 +392,6 @@ async fn run_connection(
             inbound = websocket_stream.next() => {
                 let Some(inbound) = inbound else { break };
                 let message = inbound?;
-                last_relay_activity = Instant::now();
                 match message {
                     Message::Text(text) => {
                         if text.len() > MAX_RELAY_MESSAGE_BYTES {
@@ -272,12 +403,18 @@ async fn run_connection(
                             "server.hello" => {
                                 authenticated = true;
                                 let _ = heartbeat_state_tx.send(true);
+                                last_heartbeat_ack = Instant::now();
+                                telemetry.record(&heartbeat_tracker, last_heartbeat_ack);
                                 compatible = value.get("compatible").and_then(Value::as_bool) == Some(true);
                                 if compatible {
-                                    info!(host_id = %config.host_id, "agent relay authenticated");
+                                    info!(
+                                        host_tag,
+                                        phase = "authenticated",
+                                        "agent relay authenticated"
+                                    );
                                     let _ = cache_state_tx.send(true);
                                 } else {
-                                    warn!(host_id = %config.host_id, "Kimi protocol is unsupported; control operations remain blocked");
+                                    warn!(host_tag, "Kimi protocol is unsupported; control operations remain blocked");
                                 }
                             }
                             "browser.channel.open" if authenticated && compatible => {
@@ -357,7 +494,7 @@ async fn run_connection(
                                     }
                                     Err(error) => {
                                         warn!(error = %error, "rejected an encrypted browser frame");
-                                        if let Some(channel_id) = value
+                                    if let Some(channel_id) = value
                                             .pointer("/frame/channelId")
                                             .and_then(Value::as_str)
                                         {
@@ -384,7 +521,24 @@ async fn run_connection(
                                 let _ = event_controller.unsubscribe_channel(channel_id.to_owned()).await;
                                 channels.lock().await.remove(channel_id);
                             }
-                            "server.heartbeat" => {}
+                            "server.heartbeat" => {
+                                if let Some(sequence) = value.get("sequence").and_then(Value::as_u64)
+                                    && accept_heartbeat_ack(
+                                        &mut heartbeat_tracker,
+                                        sequence,
+                                        relay_backoff,
+                                    )
+                                {
+                                    last_heartbeat_ack = Instant::now();
+                                    telemetry.record(&heartbeat_tracker, last_heartbeat_ack);
+                                    debug!(
+                                        host_tag,
+                                        phase = "heartbeat_ack",
+                                        sequence,
+                                        "relay heartbeat acknowledgement accepted"
+                                    );
+                                }
+                            }
                             "server.error" => warn!(code = ?value.get("code"), "control plane reported a relay error"),
                             _ => {}
                         }
@@ -454,20 +608,24 @@ async fn run_connection(
                 terminals.lock().await.reap_expired();
                 match result {
                     Ok(status) => {
+                        let sequence = unix_millis();
+                        heartbeat_tracker.sent(sequence);
                         outgoing_tx.send(json!({
                             "type": "agent.heartbeat",
                             "hostId": config.host_id,
-                            "sequence": unix_millis(),
+                            "sequence": sequence,
                             "state": "online",
                             "kimiVersion": status.version,
                             "loginState": normalize_login_state(&status.login_state)
                         })).await?;
                     }
                     Err(error) => {
+                        let sequence = unix_millis();
+                        heartbeat_tracker.sent(sequence);
                         outgoing_tx.send(json!({
                             "type": "agent.heartbeat",
                             "hostId": config.host_id,
-                            "sequence": unix_millis(),
+                            "sequence": sequence,
                             "state": "degraded",
                             "kimiVersion": probe.version,
                             "loginState": "unknown"
@@ -478,7 +636,17 @@ async fn run_connection(
                 }
             }
             _ = heartbeat_watchdog.tick() => {
-                if authenticated && relay_silence_exceeded(last_relay_activity.elapsed()) {
+                if authenticated && relay_silence_exceeded(last_heartbeat_ack.elapsed()) {
+                    warn!(
+                        host_tag,
+                        heartbeat_silence_seconds = last_heartbeat_ack.elapsed().as_secs(),
+                        connection_seconds = connected_at.elapsed().as_secs(),
+                        heartbeat_sent = heartbeat_tracker.sent,
+                        heartbeat_acknowledged = heartbeat_tracker.acknowledged,
+                        heartbeat_outstanding = heartbeat_tracker.outstanding.len(),
+                        "relay heartbeat acknowledgement timed out"
+                    );
+                    telemetry.record(&heartbeat_tracker, last_heartbeat_ack);
                     bail!("relay heartbeat acknowledgement timed out");
                 }
             }
@@ -490,11 +658,26 @@ async fn run_connection(
         }
     }
     drop(outgoing_tx);
+    telemetry.record(&heartbeat_tracker, last_heartbeat_ack);
+    telemetry.completed.store(true, Ordering::Relaxed);
     Ok(())
 }
 
 fn relay_silence_exceeded(elapsed: Duration) -> bool {
     elapsed > MAX_RELAY_SILENCE
+}
+
+fn relay_error_category(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("heartbeat acknowledgement timed out") {
+        "heartbeat_ack_timeout"
+    } else if message.contains("Kimi heartbeat") {
+        "kimi_heartbeat_failure"
+    } else if message.contains("relay") {
+        "relay_transport"
+    } else {
+        "other"
+    }
 }
 
 struct PreparedBrowserRequest {
@@ -773,6 +956,7 @@ fn agent_hello(config: &AgentConfig, identity: &HostIdentity, probe: &KimiProbe)
         probe.version.clone(),
         probe.openapi_sha256.clone(),
         probe.asyncapi_sha256.clone(),
+        normalize_login_state(&probe.login_state).to_owned(),
         capability_claim,
     ]
     .join("\n");
@@ -789,6 +973,7 @@ fn agent_hello(config: &AgentConfig, identity: &HostIdentity, probe: &KimiProbe)
         "kimiVersion": probe.version,
         "openapiSha256": probe.openapi_sha256,
         "asyncapiSha256": probe.asyncapi_sha256,
+        "loginState": normalize_login_state(&probe.login_state),
         "capabilities": capabilities
     }))
 }
@@ -890,5 +1075,20 @@ mod tests {
     fn expires_a_zombie_relay_connection() {
         assert!(!relay_silence_exceeded(Duration::from_secs(45)));
         assert!(relay_silence_exceeded(Duration::from_secs(46)));
+    }
+
+    #[test]
+    fn heartbeat_tracker_accepts_only_matching_acknowledgements() {
+        let mut tracker = HeartbeatTracker::default();
+        let mut relay_backoff = Duration::from_secs(30);
+        tracker.sent(41);
+        assert!(!accept_heartbeat_ack(&mut tracker, 40, &mut relay_backoff));
+        assert_eq!(relay_backoff, Duration::from_secs(30));
+        assert!(accept_heartbeat_ack(&mut tracker, 41, &mut relay_backoff));
+        assert_eq!(relay_backoff, Duration::from_secs(1));
+        assert!(!accept_heartbeat_ack(&mut tracker, 41, &mut relay_backoff));
+        assert_eq!(tracker.sent, 1);
+        assert_eq!(tracker.acknowledged, 1);
+        assert!(tracker.outstanding.is_empty());
     }
 }

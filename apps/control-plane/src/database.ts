@@ -319,6 +319,9 @@ export class ControlPlaneDatabase {
       platform: row.platform,
       agentVersion: row.agent_version,
       kimiVersion: row.kimi_version,
+      // Kimi login is runtime-only. RelayService overlays the current
+      // connection's observation; a database snapshot must stay unknown.
+      loginState: "unknown",
       lastSeenAt: row.last_seen_at,
       capabilities: JSON.parse(row.capabilities_json) as string[],
     }));

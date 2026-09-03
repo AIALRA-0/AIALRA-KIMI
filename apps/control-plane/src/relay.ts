@@ -5,6 +5,8 @@ import {
   BrowserEnvelopeSchema,
   type AgentEnvelope,
   type HostState,
+  type HostDescriptor,
+  type LoginState,
 } from "@aialra-kimi/protocol";
 import { WebSocket, WebSocketServer } from "ws";
 import type { AuthService, Principal } from "./auth.js";
@@ -17,6 +19,7 @@ interface AgentConnection {
   socket: WebSocket;
   hostId: string;
   authenticated: boolean;
+  loginState: LoginState;
 }
 
 interface BrowserConnection {
@@ -119,6 +122,7 @@ export class RelayService {
     maxPayload: MAX_FRAME_BYTES,
   });
   private readonly agents = new Map<string, AgentConnection>();
+  private readonly loginStates = new Map<string, LoginState>();
   private readonly browsers = new Set<BrowserConnection>();
   private readonly expectedOpenApi: string;
   private readonly expectedAsyncApi: string;
@@ -215,6 +219,7 @@ export class RelayService {
       connection.socket.close(1001, "server shutdown");
     for (const connection of this.browsers)
       connection.socket.close(1001, "server shutdown");
+    this.loginStates.clear();
     this.agentServer.close();
     this.browserServer.close();
   }
@@ -223,7 +228,22 @@ export class RelayService {
     const connection = this.agents.get(hostId);
     if (connection) connection.socket.close(4003, "host identity revoked");
     this.agents.delete(hostId);
+    this.loginStates.delete(hostId);
     this.broadcast({ type: "server.host.offline", hostId });
+    this.broadcast({
+      type: "server.host.status",
+      hostId,
+      state: "offline",
+      loginState: "unknown",
+      kimiVersion: null,
+    });
+  }
+
+  listHosts(): HostDescriptor[] {
+    return this.db.listHosts().map((host) => ({
+      ...host,
+      loginState: this.loginStates.get(host.hostId) ?? "unknown",
+    }));
   }
 
   private handleAgent(socket: WebSocket): void {
@@ -277,14 +297,27 @@ export class RelayService {
         const compatible =
           envelope.openapiSha256 === this.expectedOpenApi &&
           envelope.asyncapiSha256 === this.expectedAsyncApi;
-        connection = { socket, hostId: envelope.hostId, authenticated: true };
+        connection = {
+          socket,
+          hostId: envelope.hostId,
+          authenticated: true,
+          loginState: envelope.loginState,
+        };
         this.replaceAgent(connection);
+        const state: HostState = compatible ? "online" : "unsupported";
         this.db.updateHostStatus({
           hostId: envelope.hostId,
-          state: compatible ? "online" : "unsupported",
+          state,
           agentVersion: envelope.agentVersion,
           kimiVersion: envelope.kimiVersion,
           capabilities: envelope.capabilities,
+        });
+        this.broadcast({
+          type: "server.host.status",
+          hostId: envelope.hostId,
+          state,
+          loginState: envelope.loginState,
+          kimiVersion: envelope.kimiVersion,
         });
         clearTimeout(authTimer);
         send(socket, {
@@ -305,10 +338,18 @@ export class RelayService {
       clearTimeout(authTimer);
       if (connection && this.agents.get(connection.hostId)?.socket === socket) {
         this.agents.delete(connection.hostId);
+        this.loginStates.delete(connection.hostId);
         this.db.markHostOffline(connection.hostId);
         this.broadcast({
           type: "server.host.offline",
           hostId: connection.hostId,
+        });
+        this.broadcast({
+          type: "server.host.status",
+          hostId: connection.hostId,
+          state: "offline",
+          loginState: "unknown",
+          kimiVersion: null,
         });
       }
     });
@@ -326,6 +367,8 @@ export class RelayService {
       return connection.socket.close(1008, "host identity mismatch");
     }
     if (envelope.type === "agent.heartbeat") {
+      connection.loginState = envelope.loginState;
+      this.loginStates.set(connection.hostId, envelope.loginState);
       const current = this.db
         .listHosts()
         .find((host) => host.hostId === connection.hostId);
@@ -338,10 +381,18 @@ export class RelayService {
         kimiVersion: envelope.kimiVersion,
         capabilities: current?.capabilities ?? [],
       });
-      return send(connection.socket, {
+      this.broadcast({
+        type: "server.host.status",
+        hostId: connection.hostId,
+        state,
+        loginState: envelope.loginState,
+        kimiVersion: envelope.kimiVersion,
+      });
+      send(connection.socket, {
         type: "server.heartbeat",
         sequence: envelope.sequence,
       });
+      return;
     }
     if (envelope.type === "agent.session-cache") {
       this.db.replaceSessionCache(connection.hostId, envelope.sessions);
@@ -578,6 +629,7 @@ export class RelayService {
       envelope.kimiVersion ?? "",
       envelope.openapiSha256 ?? "",
       envelope.asyncapiSha256 ?? "",
+      envelope.loginState,
       envelope.capabilities.join(","),
     ].join("\n");
     try {
@@ -596,6 +648,7 @@ export class RelayService {
     const previous = this.agents.get(connection.hostId);
     if (previous) previous.socket.close(4001, "replaced by a newer connection");
     this.agents.set(connection.hostId, connection);
+    this.loginStates.set(connection.hostId, connection.loginState);
     this.broadcast({ type: "server.host.online", hostId: connection.hostId });
   }
 

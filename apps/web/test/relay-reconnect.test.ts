@@ -151,6 +151,43 @@ describe("browser relay recovery", () => {
     await expect(firstAttempt).rejects.toThrow("中继连接已取消");
   });
 
+  it("publishes the runtime login state without exposing credentials", async () => {
+    const { BrowserRelay } = await import("../src/relay.js");
+    const relay = new BrowserRelay();
+    const updates: unknown[] = [];
+    relay.subscribeHostStatus((status) => updates.push(status));
+    const controller = new AbortController();
+    const attempt = relay.open(
+      "host_windows",
+      "kimi",
+      ["sessions.list"],
+      vi.fn(),
+      controller.signal,
+    );
+    const socket = MockWebSocket.instances[0]!;
+    socket.open();
+    socket.message({ type: "server.browser.ready" });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    socket.message({
+      type: "server.host.status",
+      hostId: "host_windows",
+      state: "online",
+      loginState: "unauthenticated",
+      kimiVersion: "0.39.1",
+      token: "must-not-be-forwarded",
+    });
+    expect(updates).toEqual([
+      {
+        hostId: "host_windows",
+        state: "online",
+        loginState: "unauthenticated",
+        kimiVersion: "0.39.1",
+      },
+    ]);
+    controller.abort();
+    await expect(attempt).rejects.toThrow("中继连接已取消");
+  });
+
   it("bounds transcript recovery retries with jitter", async () => {
     const { transcriptRetryDelay } = await import("../src/recovery-policy.js");
     expect(transcriptRetryDelay(0, () => 0)).toBe(325);

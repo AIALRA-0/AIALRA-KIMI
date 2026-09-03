@@ -5,8 +5,10 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { randomBytes } from "@noble/hashes/utils.js";
 import {
   EncryptedChannelFrameSchema,
+  type HostState,
   type AgentOperation,
   type EncryptedChannelFrame,
+  type LoginState,
 } from "@aialra-kimi/protocol";
 import { api, csrfToken } from "./api.js";
 import { relayRetryDelay } from "./recovery-policy.js";
@@ -82,11 +84,28 @@ class RelayOpenError extends Error {
   }
 }
 
+export interface HostStatusUpdate {
+  hostId: string;
+  state: HostState;
+  loginState: LoginState;
+  kimiVersion: string | null;
+}
+
 export class BrowserRelay {
   private socket: WebSocket | null = null;
   private socketReady: Promise<void> | null = null;
   private readonly channels = new Map<string, ChannelState>();
   private readonly hostOnlineWaiters = new Map<string, Set<() => void>>();
+  private readonly hostStatusListeners = new Set<
+    (status: HostStatusUpdate) => void
+  >();
+
+  subscribeHostStatus(
+    listener: (status: HostStatusUpdate) => void,
+  ): () => void {
+    this.hostStatusListeners.add(listener);
+    return () => this.hostStatusListeners.delete(listener);
+  }
 
   async open(
     hostId: string,
@@ -303,6 +322,33 @@ export class BrowserRelay {
     try {
       message = JSON.parse(raw) as Record<string, unknown>;
     } catch {
+      return;
+    }
+    if (message.type === "server.host.status") {
+      const hostId =
+        typeof message.hostId === "string" ? message.hostId : undefined;
+      const state = message.state;
+      const loginState = message.loginState;
+      if (
+        !hostId ||
+        (state !== "online" &&
+          state !== "degraded" &&
+          state !== "offline" &&
+          state !== "unsupported") ||
+        (loginState !== "authenticated" &&
+          loginState !== "unauthenticated" &&
+          loginState !== "unknown")
+      )
+        return;
+      const status: HostStatusUpdate = {
+        hostId,
+        state,
+        loginState,
+        kimiVersion:
+          typeof message.kimiVersion === "string" ? message.kimiVersion : null,
+      };
+      for (const listener of this.hostStatusListeners) listener(status);
+      if (state === "online") this.wakeHost(hostId);
       return;
     }
     if (message.type === "server.host.offline") {

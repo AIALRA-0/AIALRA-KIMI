@@ -77,7 +77,18 @@ import {
 } from "./NewSessionDialog.js";
 import { PairingDialog } from "./PairingDialog.js";
 import { relayRetryDelay, transcriptRetryDelay } from "./recovery-policy.js";
-import { BrowserRelay, type RelayChannel } from "./relay.js";
+import {
+  canSendPrompt,
+  isHostChannelReady,
+  isKimiAuthenticationError,
+  kimiErrorText,
+  sameHosts,
+} from "./readiness.js";
+import {
+  BrowserRelay,
+  type HostStatusUpdate,
+  type RelayChannel,
+} from "./relay.js";
 import { TranscriptTimeline } from "./TranscriptTimeline.js";
 import {
   applyTranscriptReset,
@@ -243,11 +254,12 @@ function relativeTime(value: string | null): string {
   return `${Math.floor(minutes / 1440)} 天前`;
 }
 
-function usageErrorText(value: string): string {
-  if (/No token for ['\"]kimi-code['\"]/i.test(value)) {
-    return "这台主机尚未登录 Kimi Code，请先完成账号授权";
-  }
-  return value;
+function loginStateText(value: HostDescriptor["loginState"]): string {
+  return value === "authenticated"
+    ? "Kimi 已登录"
+    : value === "unauthenticated"
+      ? "Kimi 未登录"
+      : "Kimi 登录状态未知";
 }
 
 function messageTime(value: string): string {
@@ -548,9 +560,8 @@ export default function App() {
     session?.upstreamSessionId ?? "",
     conversationMessages.length,
   );
-  const canUseComposerAttachments = Boolean(
-    session && (demo || (host?.state === "online" && channel)),
-  );
+  const channelReady = isHostChannelReady(host, Boolean(channel), demo);
+  const canUseComposerAttachments = Boolean(session && channelReady);
 
   useEffect(() => {
     activeSessionRef.current = sessionId;
@@ -564,6 +575,25 @@ export default function App() {
         sessionsByHostRef.current.set(host.hostId, []);
     }
   }, [hosts]);
+
+  useEffect(() => {
+    if (demo) return;
+    return relay.subscribeHostStatus((update: HostStatusUpdate) => {
+      setHosts((current) =>
+        current.map((item) =>
+          item.hostId === update.hostId
+            ? {
+                ...item,
+                state: update.state,
+                loginState: update.loginState,
+                kimiVersion: update.kimiVersion,
+                lastSeenAt: new Date().toISOString(),
+              }
+            : item,
+        ),
+      );
+    });
+  }, [demo]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -850,13 +880,21 @@ export default function App() {
   useEffect(() => {
     if (demo) return;
     let active = true;
+    let ownerChecked = false;
+    let inFlight = false;
     async function loadHosts() {
+      if (inFlight) return;
+      inFlight = true;
       try {
         if (!hostsRef.current.length) setHostsPhase("loading");
-        await api.me();
-        const nextHosts = await api.hosts();
+        const nextHosts = ownerChecked
+          ? await api.hosts()
+          : (await Promise.all([api.me(), api.hosts()]))[1];
+        ownerChecked = true;
         if (!active) return;
-        setHosts(nextHosts);
+        setHosts((current) =>
+          sameHosts(current, nextHosts) ? current : nextHosts,
+        );
         setHostsPhase(nextHosts.length ? "ready" : "empty");
         if (!nextHosts.length) setSessionsPhase("empty");
         setHostId((current) => preferredHostId(nextHosts, current));
@@ -876,13 +914,23 @@ export default function App() {
           setError(
             nextError instanceof Error ? nextError.message : "控制平面不可用",
           );
+      } finally {
+        inFlight = false;
       }
     }
     void loadHosts();
-    const timer = window.setInterval(() => void loadHosts(), 3_000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void loadHosts();
+    };
+    const onFocus = () => void loadHosts();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    const timer = window.setInterval(() => void loadHosts(), 30_000);
     return () => {
       active = false;
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
     };
   }, [demo]);
 
@@ -1053,8 +1101,29 @@ export default function App() {
             setAuthRequired(true);
             return;
           }
+          if (isKimiAuthenticationError(nextError)) {
+            setHosts((current) =>
+              current.map((item) =>
+                item.hostId === host.hostId
+                  ? { ...item, loginState: "unauthenticated" }
+                  : item,
+              ),
+            );
+            setSessionsPhase("empty");
+            setStatus("在线 · Kimi 未登录");
+            setError(
+              kimiErrorText(
+                nextError instanceof Error
+                  ? nextError.message
+                  : "Kimi 账号未登录",
+              ),
+            );
+            return;
+          }
           setError(
-            nextError instanceof Error ? nextError.message : "主机通道连接失败",
+            nextError instanceof Error
+              ? kimiErrorText(nextError.message)
+              : "主机通道连接失败",
           );
           setSessionsPhase(
             host.state === "offline" ? "offline" : "reconnecting",
@@ -1548,7 +1617,9 @@ export default function App() {
       return;
     }
     if (event.type === "error") {
-      setError(String(event.payload.message ?? "Kimi 返回了错误"));
+      setError(
+        kimiErrorText(String(event.payload.message ?? "Kimi 返回了错误")),
+      );
       scheduleRefresh();
       return;
     }
@@ -2090,8 +2161,14 @@ export default function App() {
       (!text && attachments.length === 0) ||
       !session ||
       host?.state !== "online" ||
-      (!demo && !channel) ||
-      sending
+      !canSendPrompt(
+        host,
+        Boolean(session),
+        Boolean(channel),
+        demo,
+        sending,
+        Boolean(text || attachments.length),
+      )
     )
       return;
     markCompletedTurnsCollapsed();
@@ -2231,7 +2308,9 @@ export default function App() {
         attachmentIds: pendingAttachmentIds,
       };
       setError(
-        nextError instanceof Error ? nextError.message : "发送提示词失败",
+        nextError instanceof Error
+          ? kimiErrorText(nextError.message)
+          : "发送提示词失败",
       );
     } finally {
       if (sendRequestRef.current === requestGeneration) setSending(false);
@@ -3304,7 +3383,8 @@ export default function App() {
                     <small>
                       {item.mode === "vps"
                         ? "VPS · 在服务器执行"
-                        : "远端 · 在目标主机执行"}
+                        : "远端 · 在目标主机执行"}{" "}
+                      · {loginStateText(item.loginState)}
                     </small>
                   </span>
                   <i className={`host-state ${item.state}`} />
@@ -3940,9 +4020,11 @@ export default function App() {
                       ? "请选择会话"
                       : host?.state !== "online"
                         ? "等待主机恢复，草稿会保留"
-                        : !channel
-                          ? "等待代理启动，草稿会保留"
-                          : `向 ${host?.displayName ?? "所选主机"} 上的 Kimi 发送消息`
+                        : host.loginState !== "authenticated"
+                          ? "请先完成 Kimi 登录，草稿会保留"
+                          : !channel
+                            ? "等待代理启动，草稿会保留"
+                            : `向 ${host?.displayName ?? "所选主机"} 上的 Kimi 发送消息`
                   }
                   disabled={!session}
                   rows={2}
@@ -4052,13 +4134,15 @@ export default function App() {
                     <span>
                       {host?.state !== "online"
                         ? "等待主机恢复，草稿会保留"
-                        : !channel
-                          ? "等待代理启动"
-                          : session.permissionMode === "yolo"
-                            ? "YOLO 自动批准常规工具"
-                            : session.permissionMode === "auto"
-                              ? "自动批准安全工具"
-                              : "工具操作需要批准"}
+                        : host.loginState !== "authenticated"
+                          ? "Kimi 未登录，发送已禁用；请到用量页完成官方授权"
+                          : !channel
+                            ? "等待代理启动"
+                            : session.permissionMode === "yolo"
+                              ? "YOLO 自动批准常规工具"
+                              : session.permissionMode === "auto"
+                                ? "自动批准安全工具"
+                                : "工具操作需要批准"}
                     </span>
                   </div>
                   <button
@@ -4067,6 +4151,7 @@ export default function App() {
                     disabled={
                       (!prompt.trim() && attachments.length === 0) ||
                       host?.state !== "online" ||
+                      host?.loginState !== "authenticated" ||
                       !channel ||
                       sending
                     }
@@ -4228,7 +4313,7 @@ export default function App() {
                   flow={oauthFlow}
                   message={
                     usage?.upstreamError
-                      ? usageErrorText(usage.upstreamError)
+                      ? kimiErrorText(usage.upstreamError)
                       : "所选主机尚未登录官方 Kimi 账号"
                   }
                   onRegionChange={setOauthRegion}

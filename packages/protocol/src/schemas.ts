@@ -8,14 +8,21 @@ export const HOST_STATES = [
   "offline",
   "unsupported",
 ] as const;
+export const LOGIN_STATES = [
+  "authenticated",
+  "unauthenticated",
+  "unknown",
+] as const;
 export const PERMISSION_MODES = ["manual", "auto", "yolo"] as const;
 
 export const HostModeSchema = z.enum(HOST_MODES);
 export const HostStateSchema = z.enum(HOST_STATES);
+export const LoginStateSchema = z.enum(LOGIN_STATES);
 export const PermissionModeSchema = z.enum(PERMISSION_MODES);
 
 export type HostMode = z.infer<typeof HostModeSchema>;
 export type HostState = z.infer<typeof HostStateSchema>;
+export type LoginState = z.infer<typeof LoginStateSchema>;
 export type PermissionMode = z.infer<typeof PermissionModeSchema>;
 
 export const HostSessionRefSchema = z.object({
@@ -81,6 +88,7 @@ export const HostDescriptorSchema = z.object({
   platform: z.enum(["windows", "linux"]),
   agentVersion: z.string().min(1),
   kimiVersion: z.string().nullable(),
+  loginState: LoginStateSchema,
   lastSeenAt: z.string().datetime().nullable(),
   capabilities: z.array(z.string()),
 });
@@ -126,6 +134,7 @@ export const AgentEnvelopeSchema = z.discriminatedUnion("type", [
       .string()
       .regex(/^[0-9a-f]{64}$/)
       .nullable(),
+    loginState: LoginStateSchema,
     capabilities: z.array(z.string().min(1).max(80)).max(64),
   }),
   z.object({
@@ -134,7 +143,7 @@ export const AgentEnvelopeSchema = z.discriminatedUnion("type", [
     sequence: z.number().int().nonnegative(),
     state: z.enum(["online", "degraded"]),
     kimiVersion: z.string().nullable(),
-    loginState: z.enum(["authenticated", "unauthenticated", "unknown"]),
+    loginState: LoginStateSchema,
   }),
   z.object({
     type: z.literal("agent.session-cache"),
