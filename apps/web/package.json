@@ -14,7 +14,7 @@
   "dependencies": {
     "@aialra-kimi/protocol": "workspace:*",
     "@noble/ciphers": "2.0.1",
-    "@noble/curves": "2.0.1",
+    "@noble/curves": "2.4.0",
     "@noble/hashes": "2.0.1",
     "@xterm/addon-fit": "0.10.0",
     "@xterm/xterm": "5.5.0",
